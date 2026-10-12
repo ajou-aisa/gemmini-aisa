@@ -97,8 +97,13 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
                                                                              headerFileName: String = "gemmini_params.h",
                                                                               
                                                                              // PoTal: saturating INT32 accumulator RMW
-                                                                             enablePoTalSat32Acc: Boolean = false
+                                                                             enablePoTalSat32Acc: Boolean = false,
+                                      
+                                                                             // Reserved for W3-2: scale-aware SCU writeback
+                                                                             enablePoTalWriteback: Boolean = false
                                                        ) {
+  require(!enablePoTalWriteback, "PoTalWriteback requires W3-2 Controller integration")
+  
   val sp_width = meshColumns * tileColumns * inputType.getWidth
   val sp_bank_entries = sp_capacity match {
     case CapacityInKilobytes(kb) => kb * 1024 * 8 / (sp_banks * sp_width)
