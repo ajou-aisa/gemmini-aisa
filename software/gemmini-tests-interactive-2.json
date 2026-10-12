@@ -1,0 +1,11 @@
+{
+  "name" : "gemmini-tests-interactive-2",
+  "workdir" : ".",
+  "base" : "br-base.json",
+     
+  "simluatoin_outputs": ["test.log"],
+  "overlay" : "overlay",
+  "host-init" : "host-init.sh",
+  "rootfs-size" : "16GiB",
+  "spike-args": "--extension=gemmini",
+}

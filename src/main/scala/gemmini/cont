@@ -1,0 +1,522 @@
+
+package gemmini
+
+import java.nio.charset.StandardCharsets
+import java.nio.file.{Files, Paths}
+
+import chisel3._
+import chisel3.util._
+import org.chipsalliance.cde.config._
+import freechips.rocketchip.diplomacy._
+import freechips.rocketchip.tile._
+import freechips.rocketchip.util.ClockGate
+import freechips.rocketchip.tilelink.TLIdentityNode
+import GemminiISA._
+import Util._
+
+class GemminiCmd(rob_entries: Int)(implicit p: Parameters) extends Bundle {
+  val cmd = new RoCCCommand
+  val rob_id = UDValid(UInt(log2Up(rob_entries).W))
+  val from_matmul_fsm = Bool()
+  val from_conv_fsm = Bool()
+}
+
+class Gemmini[T <: Data : Arithmetic, U <: Data, V <: Data](val config: GemminiArrayConfig[T, U, V])
+                                     (implicit p: Parameters)
+  extends LazyRoCC (
+    opcodes = config.opcodes,
+    nPTWPorts = if (config.use_shared_tlb) 1 else 2) {
+
+  Files.write(Paths.get(config.headerFilePath), config.generateHeader().getBytes(StandardCharsets.UTF_8))
+  if (System.getenv("GEMMINI_ONLY_GENERATE_GEMMINI_H") == "1") {
+    System.exit(1)
+  }
+
+  val xLen = p(XLen)
+  val spad = LazyModule(new Scratchpad(config))
+
+  override lazy val module = new GemminiModule(this)
+  override val tlNode = if (config.use_dedicated_tl_port) spad.id_node else TLIdentityNode()
+  override val atlNode = if (config.use_dedicated_tl_port) TLIdentityNode() else spad.id_node
+
+  val node = if (config.use_dedicated_tl_port) tlNode else atlNode
+}
+
+class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
+    (outer: Gemmini[T, U, V])
+    extends LazyRoCCModuleImp(outer)
+    with HasCoreParameters {
+
+  import outer.config._
+  import outer.spad
+
+  val ext_mem_io = if (use_shared_ext_mem) Some(IO(new ExtSpadMemIO(sp_banks, acc_banks, acc_sub_banks))) else None
+  ext_mem_io.foreach(_ <> outer.spad.module.io.ext_mem.get)
+
+  val tagWidth = 32
+
+  // Counters
+  val counters = Module(new CounterController(outer.config.num_counter, outer.xLen))
+  io.resp <> counters.io.out  // Counter access command will be committed immediately
+  counters.io.event_io.external_values(0) := 0.U
+  counters.io.event_io.event_signal(0) := false.B
+  counters.io.in.valid := false.B
+  counters.io.in.bits := DontCare
+  counters.io.event_io.collect(spad.module.io.counter)
+
+  // Profiler
+  val profilers = Module(new ProfilerController(outer.config, new GemminiCmd(reservation_station_entries)))
+  ProfileEventIO.init(profilers.io.profile_io.event_io)
+
+  // TLB
+  implicit val edge = outer.spad.id_node.edges.out.head
+  val tlb = Module(new FrontendTLB(2, tlb_size, dma_maxbytes, use_tlb_register_filter, use_firesim_simulation_counters, use_shared_tlb))
+  (tlb.io.clients zip outer.spad.module.io.tlb).foreach(t => t._1 <> t._2)
+
+  tlb.io.exp.foreach(_.flush_skip := false.B)
+  tlb.io.exp.foreach(_.flush_retry := false.B)
+
+  io.ptw <> tlb.io.ptw
+
+  counters.io.event_io.collect(tlb.io.counter)
+
+  spad.module.io.flush := tlb.io.exp.map(_.flush()).reduce(_ || _)
+  // tlb.io.exp.map은 TLB에서 발생하는 모든 신호를 가져옴. 이 신호는 리스트 형태로 존재하며 이 리스트들을 ||연산을 통해 하나로 묶음. -> tlb와 spad 동기화
+
+  val clock_en_reg = RegInit(true.B)
+  val gated_clock = if (clock_gate) ClockGate(clock, clock_en_reg, "gemmini_clock_gate") else clock
+  outer.spad.module.clock := gated_clock
+
+  /*
+  //=========================================================================
+  // Frontends: Incoming commands and ROB
+  //=========================================================================
+
+  // forward cmd to correct frontend. if the rob is busy, do not forward new
+  // commands to tiler, and vice versa
+  val is_cisc_mode = RegInit(false.B)
+
+  val raw_cmd = Queue(io.cmd)
+  val funct = raw_cmd.bits.inst.funct
+
+  val is_cisc_funct = (funct === CISC_CONFIG) ||
+                      (funct === ADDR_AB) ||
+                      (funct === ADDR_CD) ||
+                      (funct === SIZE_MN) ||
+                      (funct === SIZE_K) ||
+                      (funct === RPT_BIAS) ||
+                      (funct === RESET) ||
+                      (funct === COMPUTE_CISC)
+
+  val raw_cisc_cmd = WireInit(raw_cmd)
+  val raw_risc_cmd = WireInit(raw_cmd)
+  raw_cisc_cmd.valid := false.B
+  raw_risc_cmd.valid := false.B
+  raw_cmd.ready := false.B
+
+  //-------------------------------------------------------------------------
+  // cisc
+  val cmd_fsm = CmdFSM(outer.config)
+  cmd_fsm.io.cmd <> raw_cisc_cmd
+  val tiler = TilerController(outer.config)
+  tiler.io.cmd_in <> cmd_fsm.io.tiler
+
+  //-------------------------------------------------------------------------
+  // risc
+  val unrolled_cmd = LoopUnroller(raw_risc_cmd, outer.config.meshRows * outer.config.tileRows)
+  */
+
+  val reservation_station = withClock (gated_clock) { Module(new ReservationStation(outer.config, new GemminiCmd(reservation_station_entries))) }
+  counters.io.event_io.collect(reservation_station.io.counter)
+  profilers.io.profile_io.issue_cmd <> reservation_station.io.profile.issue_cmd
+  profilers.io.profile_io.event_io.collect(reservation_station.io.profile.event_io)
+  profilers.io.profile_io.event_io.connectEventSignal(ProfileEvent.ROB_ALLOC, reservation_station.io.profile.issue_cmd.fire(), reservation_station.io.profile.issue_cmd.rob_id)
+  profilers.io.profile_io.event_io.connectEventSignal(ProfileEvent.ROB_ISSUE_LD, reservation_station.io.issue.ld.fire(), reservation_station.io.issue.ld.rob_id)
+  profilers.io.profile_io.event_io.connectEventSignal(ProfileEvent.ROB_ISSUE_EX, reservation_station.io.issue.ex.fire(), reservation_station.io.issue.ex.rob_id)
+  profilers.io.profile_io.event_io.connectEventSignal(ProfileEvent.ROB_ISSUE_ST, reservation_station.io.issue.st.fire(), reservation_station.io.issue.st.rob_id)
+  profilers.io.profile_io.event_io.connectEventSignal(ProfileEvent.ROB_COMPLETE, reservation_station.io.completed.fire, reservation_station.io.completed.bits)
+  profilers.io.profile_io.queue_info.valid_ld := reservation_station.io.profile.queue_info.valid_ld
+  profilers.io.profile_io.queue_info.valid_ex := reservation_station.io.profile.queue_info.valid_ex
+  profilers.io.profile_io.queue_info.valid_st := reservation_station.io.profile.queue_info.valid_st
+
+  val clk_cnt = RegInit(0.U(32.W))
+  clk_cnt := clk_cnt + 1.U
+  reservation_station.io.clk_cnt := clk_cnt
+
+  when (io.cmd.valid && io.cmd.bits.inst.funct === CLKGATE_EN && !io.busy) {
+    clock_en_reg := io.cmd.bits.rs1(0)
+  }
+
+  val raw_cmd_q = Module(new Queue(new GemminiCmd(reservation_station_entries), entries = 2))
+  raw_cmd_q.io.enq.valid := io.cmd.valid
+  io.cmd.ready := raw_cmd_q.io.enq.ready
+  raw_cmd_q.io.enq.bits.cmd := io.cmd.bits
+  raw_cmd_q.io.enq.bits.rob_id := DontCare
+  raw_cmd_q.io.enq.bits.from_conv_fsm := false.B
+  raw_cmd_q.io.enq.bits.from_matmul_fsm := false.B
+
+  val raw_cmd = raw_cmd_q.io.deq
+
+  val max_lds = reservation_station_entries_ld
+  val max_exs = reservation_station_entries_ex
+  val max_sts = reservation_station_entries_st
+
+  // conv 명령어 처리
+  val (conv_cmd, loop_conv_unroller_busy) = withClock (gated_clock) { LoopConv(raw_cmd, reservation_station.io.conv_ld_completed, reservation_station.io.conv_st_completed, reservation_station.io.conv_ex_completed,
+    meshRows*tileRows, coreMaxAddrBits, reservation_station_entries, max_lds, max_exs, max_sts, sp_banks * sp_bank_entries, acc_banks * acc_bank_entries,
+    inputType.getWidth, accType.getWidth, dma_maxbytes,
+    new ConfigMvinRs1(mvin_scale_t_bits, block_stride_bits, pixel_repeats_bits), new MvinRs2(mvin_rows_bits, mvin_cols_bits, local_addr_t),
+    new ConfigMvoutRs2(acc_scale_t_bits, 32), new MvoutRs2(mvout_rows_bits, mvout_cols_bits, local_addr_t),
+    new ConfigExRs1(acc_scale_t_bits), new PreloadRs(mvin_rows_bits, mvin_cols_bits, local_addr_t),
+    new PreloadRs(mvout_rows_bits, mvout_cols_bits, local_addr_t),
+    new ComputeRs(mvin_rows_bits, mvin_cols_bits, local_addr_t), new ComputeRs(mvin_rows_bits, mvin_cols_bits, local_addr_t),
+    has_training_convs, has_max_pool, has_first_layer_optimizations, has_dw_convs) }
+
+  // matmul 명령어 처리
+  val (loop_cmd, loop_matmul_unroller_busy) = withClock (gated_clock) { LoopMatmul(conv_cmd, reservation_station.io.matmul_ld_completed, reservation_station.io.matmul_st_completed, reservation_station.io.matmul_ex_completed,
+    meshRows*tileRows, coreMaxAddrBits, reservation_station_entries, max_lds, max_exs, max_sts, sp_banks * sp_bank_entries, acc_banks * acc_bank_entries,
+    inputType.getWidth, accType.getWidth, dma_maxbytes, new MvinRs2(mvin_rows_bits, mvin_cols_bits, local_addr_t),
+    new PreloadRs(mvin_rows_bits, mvin_cols_bits, local_addr_t), new PreloadRs(mvout_rows_bits, mvout_cols_bits, local_addr_t),
+    new ComputeRs(mvin_rows_bits, mvin_cols_bits, local_addr_t), new ComputeRs(mvin_rows_bits, mvin_cols_bits, local_addr_t),
+    new MvoutRs2(mvout_rows_bits, mvout_cols_bits, local_addr_t)) }
+  
+  // Performance Monitor
+  val cycleCounter = Module(new CycleCounter()) 
+    cycleCounter.io.start := false.B
+    cycleCounter.io.stop := false.B
+  val counting = RegInit(false.B)
+  val start_count = RegInit(false.B)
+
+  val unrolled_cmd = Queue(loop_cmd) // loopmatmul에서 생성된 명령어를 저장함.
+  unrolled_cmd.ready := false.B
+  counters.io.event_io.connectEventSignal(CounterEvent.LOOP_MATMUL_ACTIVE_CYCLES, loop_matmul_unroller_busy)
+
+  // Wire up controllers to ROB
+  reservation_station.io.alloc.valid := false.B // reservation station에 명령어를 할당할 준비가 됐는지.
+  reservation_station.io.alloc.bits := unrolled_cmd.bits // 나중에 reservation station에 할당할 명령어 지정
+
+  /*
+  //-------------------------------------------------------------------------
+  // finish muxing control signals to rob (risc) or tiler (cisc)
+  when (raw_cmd.valid && is_cisc_funct && !rob.io.busy) {
+    is_cisc_mode       := true.B
+    raw_cisc_cmd.valid := true.B
+    raw_cmd.ready      := raw_cisc_cmd.ready
+  }
+  .elsewhen (raw_cmd.valid && !is_cisc_funct && !tiler.io.busy) {
+    is_cisc_mode       := false.B
+    raw_risc_cmd.valid := true.B
+    raw_cmd.ready      := raw_risc_cmd.ready
+  }
+  */
+
+  //=========================================================================
+  // Controllers
+  //=========================================================================
+  val load_controller = withClock (gated_clock) { Module(new LoadController(outer.config, coreMaxAddrBits, local_addr_t)) }
+  val store_controller = withClock (gated_clock) { Module(new StoreController(outer.config, coreMaxAddrBits, local_addr_t)) }
+  val ex_controller = withClock (gated_clock) { Module(new ExecuteController(xLen, tagWidth, outer.config)) }
+
+  counters.io.event_io.collect(load_controller.io.counter)
+  counters.io.event_io.collect(store_controller.io.counter)
+  counters.io.event_io.collect(ex_controller.io.counter)
+
+  /* First Enter Corresponding Controller */
+  profilers.io.profile_io.event_io.connectEventSignal(ProfileEvent.ENTER_LD_CTRL, load_controller.io.cmd.fire, load_controller.io.cmd.bits.rob_id.bits)
+  profilers.io.profile_io.event_io.connectEventSignal(ProfileEvent.ENTER_EX_CTRL, ex_controller.io.cmd.fire, ex_controller.io.cmd.bits.rob_id.bits)
+  profilers.io.profile_io.event_io.connectEventSignal(ProfileEvent.ENTER_ST_CTRL, store_controller.io.cmd.fire, store_controller.io.cmd.bits.rob_id.bits)
+
+  /* Finally Leave Conrresponding Controller */
+  profilers.io.profile_io.event_io.connectEventSignal(ProfileEvent.LEAVE_LD_CTRL, load_controller.io.completed.fire, load_controller.io.completed.bits)
+  profilers.io.profile_io.event_io.connectEventSignal(ProfileEvent.LEAVE_EX_CTRL, ex_controller.io.completed.fire, ex_controller.io.completed.bits)
+  profilers.io.profile_io.event_io.connectEventSignal(ProfileEvent.LEAVE_ST_CTRL, store_controller.io.completed.fire, store_controller.io.completed.bits)
+
+  // // /* DMA Read - Load Controller */
+  // profilers.io.profile_io.event_io.connectEventSignal(ProfileEvent.ENTER_DMA_READ, load_controller.io.dma.req.fire, load_controller.io.dma.req.bits.cmd_id)
+  // profilers.io.profile_io.event_io.connectEventSignal(ProfileEvent.LEAVE_DMA_READ, load_controller.io.dma.resp.fire, load_controller.io.dma.req.bits.cmd_id)
+
+  // // /* DMA Write - Store Controller */
+  // profilers.io.profile_io.event_io.connectEventSignal(ProfileEvent.ENTER_DMA_WRITE, store_controller.io.dma.req.fire, store_controller.io.dma.req.bits.cmd_id)
+  // profilers.io.profile_io.event_io.connectEventSignal(ProfileEvent.LEAVE_DMA_WRITE, store_controller.io.dma.resp.fire, store_controller.io.dma.resp.bits.cmd_id)
+
+  /* Internal Operations of Corresponding Controller */
+
+  profilers.io.profile_io.event_io.collect(load_controller.io.profile)
+  profilers.io.profile_io.event_io.collect(ex_controller.io.profile)
+  profilers.io.profile_io.event_io.collect(store_controller.io.profile)
+
+  /*
+  tiler.io.issue.load.ready := false.B
+  tiler.io.issue.store.ready := false.B
+  tiler.io.issue.exec.ready := false.B
+  */
+
+  reservation_station.io.issue.ld.ready := false.B
+  reservation_station.io.issue.st.ready := false.B
+  reservation_station.io.issue.ex.ready := false.B
+
+  /*
+  when (is_cisc_mode) {
+    load_controller.io.cmd  <> tiler.io.issue.load
+    store_controller.io.cmd <> tiler.io.issue.store
+    ex_controller.io.cmd  <> tiler.io.issue.exec
+  }
+  .otherwise {
+    load_controller.io.cmd.valid := rob.io.issue.ld.valid
+    rob.io.issue.ld.ready := load_controller.io.cmd.ready
+    load_controller.io.cmd.bits.cmd := rob.io.issue.ld.cmd
+    load_controller.io.cmd.bits.cmd.inst.funct := rob.io.issue.ld.cmd.inst.funct
+    load_controller.io.cmd.bits.rob_id.push(rob.io.issue.ld.rob_id)
+
+    store_controller.io.cmd.valid := rob.io.issue.st.valid
+    rob.io.issue.st.ready := store_controller.io.cmd.ready
+    store_controller.io.cmd.bits.cmd := rob.io.issue.st.cmd
+    store_controller.io.cmd.bits.cmd.inst.funct := rob.io.issue.st.cmd.inst.funct
+    store_controller.io.cmd.bits.rob_id.push(rob.io.issue.st.rob_id)
+
+    ex_controller.io.cmd.valid := rob.io.issue.ex.valid
+    rob.io.issue.ex.ready := ex_controller.io.cmd.ready
+    ex_controller.io.cmd.bits.cmd := rob.io.issue.ex.cmd
+    ex_controller.io.cmd.bits.cmd.inst.funct := rob.io.issue.ex.cmd.inst.funct
+    ex_controller.io.cmd.bits.rob_id.push(rob.io.issue.ex.rob_id)
+  }
+  */
+
+  // ld_controller와 res_station 연결 
+  load_controller.io.cmd.valid := reservation_station.io.issue.ld.valid
+  reservation_station.io.issue.ld.ready := load_controller.io.cmd.ready
+  load_controller.io.cmd.bits := reservation_station.io.issue.ld.cmd
+  load_controller.io.cmd.bits.rob_id.push(reservation_station.io.issue.ld.rob_id)
+
+  // st_controller와 res_station 연결
+  store_controller.io.cmd.valid := reservation_station.io.issue.st.valid
+  reservation_station.io.issue.st.ready := store_controller.io.cmd.ready
+  store_controller.io.cmd.bits := reservation_station.io.issue.st.cmd
+  store_controller.io.cmd.bits.rob_id.push(reservation_station.io.issue.st.rob_id)
+
+  // ex_controller와 res_station 연결
+  ex_controller.io.cmd.valid := reservation_station.io.issue.ex.valid
+  reservation_station.io.issue.ex.ready := ex_controller.io.cmd.ready
+  ex_controller.io.cmd.bits := reservation_station.io.issue.ex.cmd
+  ex_controller.io.cmd.bits.rob_id.push(reservation_station.io.issue.ex.rob_id)
+
+  // Wire up scratchpad to controllers
+  spad.module.io.dma.read <> load_controller.io.dma
+  spad.module.io.dma.write <> store_controller.io.dma
+  ex_controller.io.srams.read <> spad.module.io.srams.read
+  ex_controller.io.srams.write <> spad.module.io.srams.write
+  spad.module.io.acc.read_req <> ex_controller.io.acc.read_req
+  ex_controller.io.acc.read_resp <> spad.module.io.acc.read_resp
+  ex_controller.io.acc.write <> spad.module.io.acc.write
+
+  // Im2Col unit
+  val im2col = withClock (gated_clock) { Module(new Im2Col(outer.config)) }
+
+  // Wire up Im2col
+  counters.io.event_io.collect(im2col.io.counter)
+  // im2col.io.sram_reads <> spad.module.io.srams.read
+  im2col.io.req <> ex_controller.io.im2col.req
+  ex_controller.io.im2col.resp <> im2col.io.resp
+
+  // Wire arbiter for ExecuteController and Im2Col scratchpad reads
+	// ex_controller와 in2col 유닛이 SPAD 메모리(SRAM) 에서 데이터를 읽는 작업을 조정하는 방법 설명.
+	// 두 모듈이 충돌을 방지하기 위한 arbiter를 설정
+	// 보면, ex_controller의 sram read와 im2col sram read와 spad sram read을 하나의 list로 짝지음.
+	// 그 다음, req_arb(0)에 ex_read.req를 박고, req_arb(1)에 im2col_read.req를 박음.
+	// 그리고 sram read에 req_arb을 박음.
+  (ex_controller.io.srams.read, im2col.io.sram_reads, spad.module.io.srams.read).zipped.foreach { case (ex_read, im2col_read, spad_read) =>
+    val req_arb = Module(new Arbiter(new ScratchpadReadReq(n=sp_bank_entries), 2)) // arbiter를 선언하는데, 어느 모듈이 Scratchpad에 접근할지 우선순위를 정해줌
+
+    req_arb.io.in(0) <> ex_read.req
+    req_arb.io.in(1) <> im2col_read.req
+
+    spad_read.req <> req_arb.io.out
+
+    // TODO if necessary, change how the responses are handled when fromIm2Col is added to spad read interface
+	  // spad_read_req에 대한 반응으로 spad_read_resp를 ex_read.resp과 im2col_read.resp에 둘 다 박아줌.
+    ex_read.resp.valid := spad_read.resp.valid
+    im2col_read.resp.valid := spad_read.resp.valid
+
+    ex_read.resp.bits := spad_read.resp.bits
+    im2col_read.resp.bits := spad_read.resp.bits
+    // spad_read.resp는 ex_read 혹은 im2col_read 둘 중 아무거나 준비돼도 ready.
+    spad_read.resp.ready := ex_read.resp.ready || im2col_read.resp.ready
+  }
+
+  // Wire up controllers to ROB
+  reservation_station.io.alloc.valid := false.B // 현재 할당된 작업이 있는지 나타내는 부분 초기화
+  // rob.io.alloc.bits := compressed_cmd.bits
+  reservation_station.io.alloc.bits := unrolled_cmd.bits // resrevation station에 할당할 비트에 실질적으로 unroll된 커맨드들을 할당.
+
+  /*
+  //=========================================================================
+  // committed insn return path to frontends
+  //=========================================================================
+
+  //-------------------------------------------------------------------------
+  // cisc
+  tiler.io.completed.exec.valid := ex_controller.io.completed.valid
+  tiler.io.completed.exec.bits := ex_controller.io.completed.bits
+
+  tiler.io.completed.load <> load_controller.io.completed
+  tiler.io.completed.store <> store_controller.io.completed
+
+  // mux with cisc frontend arbiter
+  tiler.io.completed.exec.valid  := ex_controller.io.completed.valid && is_cisc_mode
+  tiler.io.completed.load.valid  := load_controller.io.completed.valid && is_cisc_mode
+  tiler.io.completed.store.valid := store_controller.io.completed.valid && is_cisc_mode
+  */
+
+  //-------------------------------------------------------------------------
+  // risc
+  // 세개의 입력을 받아 우선순위를 정하고 출력을 내는 arbiter 선언
+  val reservation_station_completed_arb = Module(new Arbiter(UInt(log2Up(reservation_station_entries).W), 3))
+
+  reservation_station_completed_arb.io.in(0).valid := ex_controller.io.completed.valid
+  reservation_station_completed_arb.io.in(0).bits := ex_controller.io.completed.bits
+
+  reservation_station_completed_arb.io.in(1) <> load_controller.io.completed // 그 다음 ld_controller에서 완료된 작업을 두번째로 넣음
+  reservation_station_completed_arb.io.in(2) <> store_controller.io.completed // 그 다음 st_controller에서 완료된 작업을 세번째로 넣음
+
+  // mux with cisc frontend arbiter
+  reservation_station_completed_arb.io.in(0).valid := ex_controller.io.completed.valid // && !is_cisc_mode // ex_controller의 valid비트
+  reservation_station_completed_arb.io.in(1).valid := load_controller.io.completed.valid // && !is_cisc_mode // ld_controller의 valid비트
+  reservation_station_completed_arb.io.in(2).valid := store_controller.io.completed.valid // && !is_cisc_mode // st_controller의 valid비트
+
+  reservation_station.io.completed.valid := reservation_station_completed_arb.io.out.valid
+  reservation_station.io.completed.bits := reservation_station_completed_arb.io.out.bits
+  reservation_station_completed_arb.io.out.ready := true.B
+
+  // Wire up global RoCC signals
+  io.busy := raw_cmd.valid || loop_conv_unroller_busy || loop_matmul_unroller_busy || reservation_station.io.busy || spad.module.io.busy || unrolled_cmd.valid || loop_cmd.valid || conv_cmd.valid
+
+  io.interrupt := tlb.io.exp.map(_.interrupt).reduce(_ || _) // 인터럽트 관리
+
+  // assert(!io.interrupt, "Interrupt handlers have not been written yet")
+
+  // Cycle counters
+  val incr_ld_cycles = load_controller.io.busy && !store_controller.io.busy && !ex_controller.io.busy // load_controller만 일하고 있으면 incr_ld_cycle
+  val incr_st_cycles = !load_controller.io.busy && store_controller.io.busy && !ex_controller.io.busy // sotre_controller만 일하고 있으면 incr_st_cycle
+  val incr_ex_cycles = !load_controller.io.busy && !store_controller.io.busy && ex_controller.io.busy // ex_controller만 일하고 있으면 incr_ex_cycle
+
+  val incr_ld_st_cycles = load_controller.io.busy && store_controller.io.busy && !ex_controller.io.busy // ld, st 일하는 경우
+  val incr_ld_ex_cycles = load_controller.io.busy && !store_controller.io.busy && ex_controller.io.busy // ld, ex 일하는 경우
+  val incr_st_ex_cycles = !load_controller.io.busy && store_controller.io.busy && ex_controller.io.busy // st, ex 일하는 경우
+
+  val incr_ld_st_ex_cycles = load_controller.io.busy && store_controller.io.busy && ex_controller.io.busy // 셋 다 일하는 경우
+
+  counters.io.event_io.connectEventSignal(CounterEvent.MAIN_LD_CYCLES, incr_ld_cycles) // 각각 카운터 증가시키는 코드
+  counters.io.event_io.connectEventSignal(CounterEvent.MAIN_ST_CYCLES, incr_st_cycles)
+  counters.io.event_io.connectEventSignal(CounterEvent.MAIN_EX_CYCLES, incr_ex_cycles)
+  counters.io.event_io.connectEventSignal(CounterEvent.MAIN_LD_ST_CYCLES, incr_ld_st_cycles)
+  counters.io.event_io.connectEventSignal(CounterEvent.MAIN_LD_EX_CYCLES, incr_ld_ex_cycles)
+  counters.io.event_io.connectEventSignal(CounterEvent.MAIN_ST_EX_CYCLES, incr_st_ex_cycles)
+  counters.io.event_io.connectEventSignal(CounterEvent.MAIN_LD_ST_EX_CYCLES, incr_ld_st_ex_cycles)
+
+  // Issue commands to controllers
+  // TODO we combinationally couple cmd.ready and cmd.valid signals here
+  // when (compressed_cmd.valid) {
+  when (unrolled_cmd.valid) { // unrolled_cmd가 valid한 경우에 다음과 같은 로직이 실행됨.
+
+    // val config_cmd_type = cmd.bits.rs1(1,0) // TODO magic numbers
+
+    //val funct = unrolled_cmd.bits.inst.funct
+    val risc_funct = unrolled_cmd.bits.cmd.inst.funct
+
+    val is_flush = risc_funct === FLUSH_CMD
+    val is_counter_op = risc_funct === COUNTER_OP
+    val is_clock_gate_en = risc_funct === CLKGATE_EN
+    
+    val is_count_start = risc_funct === COUNT_START
+    val is_count_end = risc_funct === COUNT_END
+    val is_count_taken = risc_funct === COUNTER_TAKEN
+    /*
+    val is_load = (funct === LOAD_CMD) || (funct === CONFIG_CMD && config_cmd_type === CONFIG_LOAD)
+    val is_store = (funct === STORE_CMD) || (funct === CONFIG_CMD && config_cmd_type === CONFIG_STORE)
+    val is_ex = (funct === COMPUTE_AND_FLIP_CMD || funct === COMPUTE_AND_STAY_CMD || funct === PRELOAD_CMD) ||
+    (funct === CONFIG_CMD && config_cmd_type === CONFIG_EX)
+    */
+
+    when (is_flush) { // flush인 경우에
+      val skip = unrolled_cmd.bits.cmd.rs1(0) // unrolled_cmd의 rs1의 첫번째 비트를 추출해서 스킵할지말지
+      tlb.io.exp.foreach(_.flush_skip := skip) // flush_skip을 skip함. 즉, flush
+      tlb.io.exp.foreach(_.flush_retry := !skip) // flush_retry를 스킵하지 않음. 즉, flush_retry
+
+      unrolled_cmd.ready := true.B // TODO should we wait for an acknowledgement from the TLB? // 위 작업이 끝나면 ready.
+    }
+
+    .elsewhen (is_counter_op) {
+      // If this is a counter access/configuration command, execute immediately
+      counters.io.in.valid := unrolled_cmd.valid
+      unrolled_cmd.ready := counters.io.in.ready
+      counters.io.in.bits := unrolled_cmd.bits.cmd
+    }
+
+    .elsewhen (is_clock_gate_en) {
+      unrolled_cmd.ready := true.B
+    }
+
+    .elsewhen (is_count_start) {
+      cycleCounter.io.start := true.B
+      start_count := true.B
+      counting := true.B
+      unrolled_cmd.ready := true.B
+    }
+
+    .elsewhen (is_count_end && start_count){
+      cycleCounter.io.stop := true.B
+      counting := false.B
+      unrolled_cmd.ready := true.B
+    }
+
+    .elsewhen (is_count_taken && !counting){
+      when(io.resp.ready){
+        io.resp.valid := true.B
+        io.resp.bits.rd := unrolled_cmd.bits.cmd.inst.rd
+        io.resp.bits.data := cycleCounter.io.cyclestaken
+        unrolled_cmd.ready := true.B  
+      }
+      .otherwise{
+        unrolled_cmd.ready := false.B
+      }
+    }
+    
+    .otherwise { // 나머지 경우
+      reservation_station.io.alloc.valid := true.B
+
+      when(reservation_station.io.alloc.fire) {
+        // compressed_cmd.ready := true.B
+        unrolled_cmd.ready := true.B
+      }
+    }
+  }
+
+  // Debugging signals
+  val pipeline_stall_counter = RegInit(0.U(32.W))
+  when (io.cmd.fire()) {
+    pipeline_stall_counter := 0.U
+  }.elsewhen(io.busy) { // cmd가 fire되지 않으며 io가 busy한 경우, stall을 하나씩 늘림.
+    pipeline_stall_counter := pipeline_stall_counter + 1.U
+  } // 스톨이 연속해서 많아지면 스톱함.
+  assert(pipeline_stall_counter < 10000000.U, "pipeline stall") 
+
+  /*
+  //=========================================================================
+  // Wire up global RoCC signals
+  //=========================================================================
+  io.busy := raw_cmd.valid || unrolled_cmd.valid || rob.io.busy || spad.module.io.busy || tiler.io.busy
+  io.interrupt := tlb.io.exp.interrupt
+
+  // hack
+  when(is_cisc_mode || !(unrolled_cmd.valid || rob.io.busy || tiler.io.busy)){
+    tlb.io.exp.flush_retry := cmd_fsm.io.flush_retry
+    tlb.io.exp.flush_skip  := cmd_fsm.io.flush_skip
+  }
+  */
+
+  //=========================================================================
+  // Performance Counters Access
+  //=========================================================================
+
+}
+

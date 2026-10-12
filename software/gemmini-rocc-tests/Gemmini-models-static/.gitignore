@@ -1,0 +1,20 @@
+
+# Local build output and workspaces
+workspace
+.vscode/
+__pycache__/
+*.pyc
+*.bin
+*.o
+*.so_*
+a.out
+*-linux
+*-pk
+*-baremetal
+build_*/
+src_bk/
+include_bk/
+*_bk
+output/
+/src/gpt2_params.c
+/src/gpt2_params.h

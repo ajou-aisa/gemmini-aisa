@@ -1,0 +1,21 @@
+#!/bin/bash
+
+# This script will run on the host from the workload directory
+# (e.g. workloads/example-fed) every time the workload is built.
+# It is recommended to call into something like a makefile because
+# this script may be called multiple times.
+echo "Building gemmini-rocc-tests benchmark"
+cp test.c a.out ./overlay/root/
+cd gemmini-rocc-tests
+autoconf
+mkdir -p build && cd build
+../configure
+make TARGET=riscv64-unknown-linux-gnu- -j
+# cp -r ./* ../../overlay/root/
+cp -r ./bareMetalC ../../overlay/root/
+cd /home/alveo/firesim/target-design/chipyard/generators/gemmini/software/gemmini-rocc-tests/Gemmini-models-static
+./build_gpt.sh
+
+# cd /home/alveo/Gemmini-models/src
+# make pk
+# mv /home/alveo/Gemmini-models/src/gpt2-pk /home/alveo/firesim/target-design/chipyard/generators/gemmini/software/overlay/root

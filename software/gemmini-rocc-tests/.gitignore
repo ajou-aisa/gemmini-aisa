@@ -1,0 +1,24 @@
+*~
+*#
+build
+autom4te.cache
+configure
+.ipynb_checkpoints
+*.pyc
+
+# Local build output and workspaces
+workspace
+.vscode/
+__pycache__/
+*.pyc
+*.bin
+*.o
+*.so_*
+a.out
+*-linux
+*-pk
+*-baremetal
+build_*/
+src_bk/
+include_bk/
+*_bk

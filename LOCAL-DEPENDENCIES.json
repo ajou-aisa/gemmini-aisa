@@ -1,0 +1,56 @@
+[
+  {
+    "path": "software/gemmini-rocc-tests",
+    "url": "https://github.com/ajou-aisa/gemmini-rocc-tests-aisa.git",
+    "commit": "1b41ff7100f1243f4918204321c2ec98d319630d",
+    "available": true
+  },
+  {
+    "path": "software/onnxruntime-riscv",
+    "url": "https://github.com/pranav-prakash/onnxruntime-riscv.git",
+    "commit": "f6d2fc95463316ec47d7f832f35be03c26887922",
+    "available": false
+  },
+  {
+    "path": "software/libgemmini",
+    "url": "https://github.com/ajou-aisa/libgemmini-aisa.git",
+    "commit": "d0247b7e3e1155584cb215fc0cd943cbeada89dd",
+    "available": true
+  },
+  {
+    "path": "software/gemmini-rocc-tests/rocc-software",
+    "url": "https://github.com/ibm/rocc-software",
+    "commit": "fddb795a0b52e82f8f4ce9ead9b1428440a62ab0",
+    "available": true
+  },
+  {
+    "path": "software/gemmini-rocc-tests/riscv-tests",
+    "url": "https://github.com/riscv/riscv-tests.git",
+    "commit": "c84daca8824635b7d896003c78f9c6245997cf7a",
+    "available": true
+  },
+  {
+    "path": "software/gemmini-rocc-tests/include",
+    "url": "https://github.com/ajou-aisa/RISC-V-DynDNN-gemmini-include.git",
+    "commit": "18837857060efd9448b93617ab39720aadf756e2",
+    "available": true
+  },
+  {
+    "path": "software/gemmini-rocc-tests/Gemmini-models",
+    "url": "https://github.com/ajou-aisa/Gemmini-models-aisa.git",
+    "commit": "f74eb248b3791a914900a5ef21595fffbade1aa3",
+    "available": true
+  },
+  {
+    "path": "software/gemmini-rocc-tests/Gemmini-models-static",
+    "url": "https://github.com/ajou-aisa/Gemmini-models-static-aisa.git",
+    "commit": "0f772d692051f82ae6271f51bd8864648ddd9c23",
+    "available": true
+  },
+  {
+    "path": "software/gemmini-rocc-tests/riscv-tests/env",
+    "url": "https://github.com/riscv/riscv-test-env.git",
+    "commit": "0666378f353599d01fc48562b431b1dd049faab5",
+    "available": true
+  }
+]
