@@ -1,0 +1,4 @@
+[submodule "software/workspace/llama.cpp"]
+	path = software/workspace/llama.cpp
+	url = https://github.com/ajou-aisa/llama.cpp-gemmini.git
+	branch = exsia-pipeline

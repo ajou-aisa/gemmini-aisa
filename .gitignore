@@ -363,3 +363,8 @@ include_bk/
 
 # Generated editor symbol indexes
 tags
+
+# Keep the llama.cpp submodule; other workspace content stays local.
+!software/workspace/
+software/workspace/*
+!software/workspace/llama.cpp/
