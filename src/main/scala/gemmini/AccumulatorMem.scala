@@ -60,28 +60,49 @@ class AccumulatorMemIO [T <: Data: Arithmetic, U <: Data](n: Int, t: Vec[Vec[T]]
   }
 }
 
-class AccPipe[T <: Data : Arithmetic](latency: Int, t: T)(implicit ev: Arithmetic[T]) extends Module {
+class AccPipe[T <: Data : Arithmetic](latency: Int, t: T, saturateInt32: Boolean = false)(implicit ev: Arithmetic[T]) extends Module {
   val io = IO(new Bundle {
     val op1 = Input(t.cloneType)
     val op2 = Input(t.cloneType)
     val sum = Output(t.cloneType)
   })
   import ev._
-  io.sum := ShiftRegister(io.op1 + io.op2, latency)
+
+  if (saturateInt32) {
+    require(t.isInstanceOf[SInt] && t.getWidth == 32, "PoTal Sat32 requires signed 32-bit accumulator elements")
+
+    // Sign-extend both operands before addition
+    val a = io.op1.asUInt.asSInt.pad(33)
+    val b = io.op2.asUInt.asSInt.pad(33)
+    val wideSum = a +& b // 34-bit signed result
+
+    val max32 = 2147483647L.S(34.W)
+    val min32 = (-2147483648L).S(34.W)
+
+    val saturated = Mux(wideSum > max32, max32, Mux(wideSum < min32, min32, wideSum))
+
+    io.sum := ShiftRegister(saturated(31, 0).asTypeOf(io.sum), latency)
+  } else {
+    // Preserve the existing Gemmini behavior
+    io.sum := ShiftRegister(io.op1 + io.op2, latency)
+  }
 }
 
-class AccPipeShared[T <: Data : Arithmetic](latency: Int, t: Vec[Vec[T]], banks: Int) extends Module {
+class AccPipeShared[T <: Data : Arithmetic](latency: Int, t: Vec[Vec[T]], banks: Int, saturateInt32: Boolean = false) extends Module {
   val io = IO(new Bundle {
     val in_sel = Input(Vec(banks, Bool()))
     val ina = Input(Vec(banks, t.cloneType))
     val inb = Input(Vec(banks, t.cloneType))
     val out = Output(t.cloneType)
   })
+  // original one-hot bank selection
   val ina = Mux1H(io.in_sel, io.ina)
   val inb = Mux1H(io.in_sel, io.inb)
+
+  // One arithmetic lane per output element
   io.out := VecInit((ina zip inb).map { case (rv, wv) =>
     VecInit((rv zip wv).map { case (re, we) =>
-      val m = Module(new AccPipe(latency, t.head.head.cloneType))
+      val m = Module(new AccPipe(latency, t.head.head.cloneType, saturateInt32 = saturateInt32))
       m.io.op1 := re
       m.io.op2 := we
       m.io.sum

@@ -94,7 +94,10 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
                                                                              use_shared_ext_mem: Boolean = false,
                                                                              clock_gate: Boolean = false,
 
-                                                                             headerFileName: String = "gemmini_params.h"
+                                                                             headerFileName: String = "gemmini_params.h",
+                                                                              
+                                                                             // PoTal: saturating INT32 accumulator RMW
+                                                                             enablePoTalSat32Acc: Boolean = false
                                                        ) {
   val sp_width = meshColumns * tileColumns * inputType.getWidth
   val sp_bank_entries = sp_capacity match {
