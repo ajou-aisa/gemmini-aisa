@@ -111,7 +111,33 @@ object PoTalConfigs {
       // Keep the default Gemmini header untouched.
       headerFileName = "gemmini_potal_params.h"
     )
+
+  
+  // Configurable array geometry.
+  // Scale BlockSize is a runtime parameter,
+  // not a property of this hardware configuration.
+
+  def a8w8Sat32(dim: Int):
+    GemminiArrayConfig[SInt, Float, Float] = {
+
+    require(Set(16, 32, 64).contains(dim), s"Unsupported PoTal DIM: $dim")
+
+    // A8W8 full-DIM raw reduction width.
+    val partialBits = 16 + Integer.numberOfTrailingZeros(dim)
+
+    a8w8D16Sat32.copy(
+      meshRows = dim,
+      meshColumns = dim,
+      spatialArrayOutputType = SInt(partialBits.W),
+      headerFileName = s"gemmini_potal_d${dim}_params.h"
+    )
+  }
+
+  val a8w8D32Sat32 = a8w8Sat32(32)
+  val a8w8D64Sat32 = a8w8Sat32(64)
+
 }
+
 
 
 // ============================================================
@@ -126,3 +152,12 @@ class PoTalSat32GemminiConfig
       PoTalConfigs.a8w8D16Sat32
     )
 
+class PoTalSat32D32GemminiConfig
+    extends DefaultGemminiConfig[SInt, Float, Float](
+      PoTalConfigs.a8w8D32Sat32
+    )
+
+class PoTalSat32D64GemminiConfig
+    extends DefaultGemminiConfig[SInt, Float, Float](
+      PoTalConfigs.a8w8D64Sat32
+    )

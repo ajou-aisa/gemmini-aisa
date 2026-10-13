@@ -342,6 +342,10 @@ class LoopMatmulExecuteReq(val block_size: Int, val coreMaxAddrBits: Int, val it
   val a_tranpose = Bool()
   val b_tranpose = Bool()
   val accumulate = Bool()
+  
+  // Runtime-configured scale block size in array passes.
+  val passesPerBlock = UInt(iterator_bitwidth.W)
+
   val a_addr_start = UInt(log2Up(max_addr).W)
   val b_addr_end = UInt(log2Up(max_addr+1).W)
   val c_addr_start = UInt(log2Up(max_acc_addr).W)
@@ -360,6 +364,9 @@ class LoopMatmulExecute(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth
     val k = Output(UInt(iterator_bitwidth.W))
     val j = Output(UInt(iterator_bitwidth.W))
     val i = Output(UInt(iterator_bitwidth.W))
+    
+    // Current scale block selected by K traversal.
+    val scaleBlockIndex = Output(UInt(iterator_bitwidth.W))
 
     val ld_ka = Input(UInt(iterator_bitwidth.W))
     val ld_kb = Input(UInt(iterator_bitwidth.W))
@@ -389,6 +396,20 @@ class LoopMatmulExecute(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth
   val k = Reg(UInt(iterator_bitwidth.W))
   val j = Reg(UInt(iterator_bitwidth.W))
   val i = Reg(UInt(iterator_bitwidth.W))
+
+  // Scale-block traversal state
+  // 
+  // passInBlock: 0 ... passesPerBlock-1
+  // scaleBlockIndex: logical scale block number
+  //
+  // Advance only after the final (i,j) COMPUTE
+  // belonging to the current K tile is accepted.
+  val scaleCounter = Module(new PoTalScaleBlockCounter(iterator_bitwidth))
+  scaleCounter.io.start := io.req.fire
+  scaleCounter.io.passesPerBlock := req.passesPerBlock
+  scaleCounter.io.commandAccepted := io.cmd.fire
+  scaleCounter.io.isCompute := state === comp
+  scaleCounter.io.lastOutputTile := (i === req.max_i - 1.U) && (j === req.max_j - 1.U)  
 
   val a_row = Mux(req.a_tranpose, k, i)
   val a_col = Mux(req.a_tranpose, i, k)
@@ -452,6 +473,9 @@ class LoopMatmulExecute(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth
   io.k := k
   io.j := j
   io.i := i
+  
+  io.scaleBlockIndex := scaleCounter.io.blockIndex
+
   io.idle := state === idle
 
   // The order here is k, j, i
@@ -469,12 +493,15 @@ class LoopMatmulExecute(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth
     state := idle
   }.elsewhen (io.cmd.fire) {
     when (state === pre) {
+      // PRELOAD accepted.
+      // Scale-block counters do NOT advance here.
       state := comp
     }.otherwise {
+      // COMPUTE accepted.
       val next_i = floorAdd(i, 1.U, req.max_i)
       val next_j = floorAdd(j, 1.U, req.max_j, next_i === 0.U)
       val next_k = floorAdd(k, 1.U, req.max_k, next_j === 0.U && next_i === 0.U)
-
+      
       k := next_k
       j := next_j
       i := next_i
@@ -484,6 +511,8 @@ class LoopMatmulExecute(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth
   }
 
   when (io.req.fire) {
+    assert(io.req.bits.passesPerBlock =/= 0.U, "PoTal: passesPerBlock must be positive")
+    
     req := io.req.bits
     state := pre
     j := 0.U
@@ -723,6 +752,9 @@ class LoopMatmulState(val iterator_bitwidth: Int, val coreMaxAddrBits: Int, val 
   val potalScaleBase = UInt(16.W)
   val potalScaleGeneration = UInt(8.W)  
 
+  // Number of physical DIM-wide K passes per scale block.
+  val potalPassesPerBlock = UInt(16.W)
+
   val a_ex_spad_id = UInt(2.W)
   val b_ex_spad_id = UInt(2.W)
   val configured = Bool()
@@ -754,6 +786,7 @@ class LoopMatmulState(val iterator_bitwidth: Int, val coreMaxAddrBits: Int, val 
     potalEnabled := false.B
     potalScaleBase := 0.U
     potalScaleGeneration := 0.U
+    potalPassesPerBlock := 1.U
 
     running := false.B
 
@@ -889,9 +922,9 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   when(potalExPreload && potalExLoop.potalEnabled) {
     io.out.bits.potal.valid := true.B
 
-    // DIM16: K16 indices 0,1 -> block 0;
-    //        K16 indices 2,3 -> block 1.
-    io.out.bits.potal.blockIndex := ex.io.k >> 1
+    // Runtime-configured scale block index.
+    // Provided by LoopMatmulExecute.
+    io.out.bits.potal.blockIndex := ex.io.scaleBlockIndex
     
     io.out.bits.potal.scaleBase := potalExLoop.potalScaleBase
     io.out.bits.potal.scaleGeneration := potalExLoop.potalScaleGeneration
@@ -903,6 +936,10 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
 
     when(io.out.fire) {
       assert(potalLocalWork < PoTalProtocol.WorkIdsPerLoop.U, "PoTal: output work ID overflow")
+
+      // Verify the address before truncating it to the physical scale-cache address width.
+      val scaleSlot = potalExLoop.potalScaleBase +& (ex.io.scaleBlockIndex * potalExLoop.max_j) +& ex.io.j
+      assert(scaleSlot < PoTalProtocol.ScaleEntries.U, "PoTal: scale cache address overflow")
     }
   }
 
@@ -994,13 +1031,15 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
         // rs1[20]    : nable
         // rs1[36:21] : scaleBase
         // rs1[44:37] : scaleGeneration
-        
+        // rs1[60:45] : passesPerBlock 
         val potalEnable = cmd.bits.cmd.rs1(20)
         val scaleBase = cmd.bits.cmd.rs1(36, 21)
-        
+        val passesPerBlock = cmd.bits.cmd.rs1(60, 45)
+
         loop_being_configured.potalEnabled := potalEnable
         loop_being_configured.potalScaleBase := scaleBase
         loop_being_configured.potalScaleGeneration := cmd.bits.cmd.rs1(44, 37)
+        loop_being_configured.potalPassesPerBlock := Mux(potalEnable, passesPerBlock, 1.U)        
 
         when(potalEnable) {
           val maxI = loop_being_configured.max_i
@@ -1009,19 +1048,24 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
 
           val outputTiles = maxI * maxJ
 
-          // Dim16: 2 physical K tiles per K32 block.
-          val k32Blocks = (maxK +& 1.U) >> 1
-
-          val scaleCount = k32Blocks * maxJ
-          val scaleEnd = scaleBase +& scaleCount
-
+          // CPU already checked:
+          // scaleBlockK >= DIM
+          // scaleBlockK % DIM == 0
+          //
+          // So the encoded ratio must be nonzero.
+          assert(passesPerBlock =/= 0.U, "PoTal: passesPerBlock must be positive")
           assert(maxI > 0.U && maxJ > 0.U && maxK > 0.U, "PoTal: invalid dimensions")
           assert(outputTiles <= PoTalProtocol.WorkIdsPerLoop.U, "PoTal: work ID capacity exceeded")
-          assert(scaleEnd <= PoTalProtocol.ScaleEntries.U, "PoTal: scale cache capacity exceeded")
-          assert(loop_being_configured.pad_i < 16.U && 
-                 loop_being_configured.pad_j < 16.U &&
-                 loop_being_configured.pad_k < 16.U, "PoTal: invalid padding")
-          assert(cmd.bits.cmd.rs2(2) === 0.U && cmd.bits.cmd.rs2(1, 0) === 0.U, "PoTal: transpose/resadd unsupported")
+          assert(scaleBase <= PoTalProtocol.ScaleEntries.U, "PoTal: invalid scale base")
+
+          // At least the first N-tile scale block
+          // must fit in the selected scale window
+          assert(maxJ <= (PoTalProtocol.ScaleEntries.U - scaleBase), "PoTal: first scale block exceeds cache")
+          assert(loop_being_configured.pad_i < block_size.U && 
+                 loop_being_configured.pad_j < block_size.U &&
+                 loop_being_configured.pad_k < block_size.U, "PoTal: invalid padding")
+          assert(cmd.bits.cmd.rs2(2) === 0.U && 
+                 cmd.bits.cmd.rs2(1, 0) === 0.U, "PoTal: transpose/resadd unsupported")
         }
         loop_being_configured.configured := true.B
 
@@ -1084,6 +1128,9 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   ex.io.req.bits.pad_k := loop_requesting_ex.pad_k
   ex.io.req.bits.pad_i := loop_requesting_ex.pad_i
   ex.io.req.bits.accumulate := loop_requesting_ex.ex_accumulate
+
+  ex.io.req.bits.passesPerBlock := loop_requesting_ex.potalPassesPerBlock
+
   ex.io.req.bits.a_addr_start := Mux(loop_requesting_ex.a_ex_spad_id === 0.U, loop_requesting_ex.a_addr_start, (loop_requesting_ex.a_ex_spad_id - 1.U) * (max_addr / concurrent_loops).U)
   ex.io.req.bits.b_addr_end := Mux(loop_requesting_ex.b_ex_spad_id === 0.U, loop_requesting_ex.b_addr_end, (loop_requesting_ex.b_ex_spad_id) * (max_addr / concurrent_loops).U) 
   ex.io.req.bits.a_tranpose := loop_requesting_ex.a_transpose

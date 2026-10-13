@@ -3,25 +3,44 @@ package gemmini
 
 import chisel3._
 
+
 object PoTalProtocol {
-  val Dim = 16
-  val KBlockSize = 32
+  // No fixed DIM or scale BlockSize.
+  // scaleBlockK = config.DIM * passesPerBlock
 
   val ScaleEntries = 256
   val GenerationWidth = 8
 
   val WorkEntries = 128
   val WorkIdWidth = 7
-
-  // LoopMatmul supports up to two concurrent loops.
-  // Reserve 64 work IDs for each loop.
   val WorkIdsPerLoop = 64
+
+  // CPU-side contract:
+  // passesPerBlock = scaleBlockK / DIM
+  // passesPerBlock >= 1
+  // scaleBlockK % DIM == 0
+
+  def passesPerBlock(
+    dim: Int,
+    scaleBlockK: Int
+  ): Int = {
+    require(dim > 0)
+    require(scaleBlockK >= dim)
+    require(scaleBlockK % dim == 0)
+
+    val passes = scaleBlockK / dim
+
+    require(passes <= 65535)
+    passes
+  }
 }
+
 
 class PoTalCommandMetadata extends Bundle {
   val valid = Bool()
 
-  // K32 block index within the current scale window.
+  // Scale block index within the active scale window.
+  // One block contains passesPerBlock array K tiles.
   val blockIndex = UInt(16.W)
 
   val scaleBase = UInt(16.W)
