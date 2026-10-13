@@ -42,6 +42,14 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     }
 
     val completed = Valid(UInt(log2Up(reservation_station_entries).W))
+    
+    // W3-2c-3: classify raw ACC writes by Mesh tag.
+    val potalRawWriteValid = Output(Vec(acc_banks, Bool()))
+
+    // Mesh-side completion of a PoTal PRELOAD.
+    // This is not yet the final ROB completion.
+    val potalMeshCompleted = Output(Valid(UInt(ROB_ID_WIDTH.W)))
+    
     val busy = Output(Bool())
 
     val counter = new CounterEventIO()
@@ -55,8 +63,12 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     val rows = UInt(log2Up(block_size + 1).W)
     val cols = UInt(log2Up(block_size + 1).W)
 
+    // Identifies PoTal output independently of currnet mode.
+    val potal = Bool()
+
     override def make_this_garbage(dummy: Int = 0): Unit = {
       rob_id.valid := false.B
+      potal := false.B
       addr.make_this_garbage()
     }
   }
@@ -204,6 +216,7 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   mesh.io.req.bits.a_transpose := cntl.a_transpose
   mesh.io.req.bits.bd_transpose := cntl.bd_transpose
   mesh.io.req.bits.tag.rob_id := cntl.rob_id
+  mesh.io.req.bits.tag.potal := cntl.potal
   mesh.io.req.bits.flush := Mux(control_state === flush && !cntl_valid, 1.U, 0.U) // We want to make sure that the mesh has absorbed all inputs before flushing
 
   // Hazards
@@ -737,6 +750,7 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     val total_rows = UInt(log2Up(block_size + 1).W)
 
     val rob_id = UDValid(UInt(log2Up(reservation_station_entries).W))
+    val potal = Bool()
 
     val dataflow = UInt(1.W)
     val prop = UInt(1.W)
@@ -791,6 +805,12 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
 
   mesh_cntl_signals_q.io.enq.bits.rob_id.valid := !performing_single_mul && !c_address_rs2.is_garbage()
   mesh_cntl_signals_q.io.enq.bits.rob_id.bits := cmd.bits(preload_cmd_place).rob_id.bits
+
+  // Associate PoTal metadata with the PRELOAD
+  // that owns the eventual Mesh output.
+  mesh_cntl_signals_q.io.enq.bits.potal := !performing_single_mul &&
+                                           !c_address_rs2.is_garbage() &&
+                                           cmd.bits(preload_cmd_place).potal.valid
 
   mesh_cntl_signals_q.io.enq.bits.dataflow := current_dataflow
   mesh_cntl_signals_q.io.enq.bits.prop := Mux(performing_single_preload, in_prop_flush, in_prop)//prop) //available propagate or not?
@@ -962,6 +982,13 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     assert(!(io.acc.write(i).valid && !io.acc.write(i).ready), "Execute controller write to AccumulatorMem was skipped")
   }
 
+  // W3-2c-3: identify raw writes belonging to PoTal.
+  // The original ACC data path is still unchanged.
+  for (bank <- 0 until acc_banks) {
+    io.potalRawWriteValid(bank) := io.acc.write(bank).valid &&
+                                   mesh.io.resp.bits.tag.potal
+  }
+
   // Handle dependencies and turn off outputs for garbage addresses
   val mesh_completed_rob_id_fire = WireInit(false.B)
   //val complete_lock = RegInit(false.B)
@@ -978,6 +1005,16 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     }
     start_array_outputting :=  !is_garbage_addr
   }
+
+  // Indicates that the Mesh produced its final
+  // row for a PoTal PRELOAD.
+  //
+  // Final ROB completion must later be delayed
+  // until SCU-scaled ACC writes have committed.
+  io.potalMeshCompleted.valid := mesh_completed_rob_id_fire &&
+                                 mesh.io.resp.bits.tag.potal
+
+  io.potalMeshCompleted.bits := mesh.io.resp.bits.tag.rob_id.bits
 
   when (!mesh_completed_rob_id_fire) {
     when(pending_completed_rob_ids(0).valid) {

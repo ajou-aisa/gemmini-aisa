@@ -125,6 +125,20 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
       None
     }
 
+  // W3-2c-4b: route conventional and PoTal ACC writes.
+  val potalAccRouterOpt =
+    if (enablePoTalSat32Acc) {
+      Some(withClock(gated_clock) {
+        Module(new PoTalAccWriteRouter(
+          dim = DIM,
+          accBanks = acc_banks,
+          accBankEntries = acc_bank_entries
+        ))
+      })
+    } else {
+      None
+    }
+
   // Connect scale commands to the actual ScaleMemory
   // owned by PoTalWriteback.
   potalIngressOpt.zip(potalWritebackOpt).foreach {
@@ -137,22 +151,8 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
 
       ingress.io.releaseMiss := wb.io.error.releaseMiss
 
-      // W3-2b-2: do not connect the raw datapath yet.
-      wb.io.rawCompletion.valid := false.B
-      wb.io.rawCompletion.bits := 0.U
-
-      for (bank <- 0 until acc_banks) {
-        wb.io.rawWrite(bank).valid := false.B
-        wb.io.rawWrite(bank).bits := 0.U.asTypeOf(wb.io.rawWrite(bank).bits)
-
-        // No scaled writes can be generated without a context.
-        // Acknowledge the unused output for this stage only.
-        wb.io.scaledWrite(bank).ready := true.B
-      }
-
-      wb.io.robCompletion.ready := true.B
       wb.io.workDone.ready := true.B
-  }
+   }
 
   // W3-2c-2: Connect atomic PRELOAD reservation
   // to the existing PoTalWriteback context queue.
@@ -428,8 +428,49 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   ex_controller.io.srams.write <> spad.module.io.srams.write
   spad.module.io.acc.read_req <> ex_controller.io.acc.read_req
   ex_controller.io.acc.read_resp <> spad.module.io.acc.read_resp
-  ex_controller.io.acc.write <> spad.module.io.acc.write
 
+  
+  // ============================================================
+  // W3-2c-4b: ACC write routing
+  //
+  // Normal EX output -> physical ACC
+  // PoTal EX output  -> PoTalWriteback.rawWrite
+  // Scaled output    -> physical ACC
+  // ============================================================
+
+  potalAccRouterOpt.zip(potalWritebackOpt) match {
+    case Some((router, wb)) =>
+
+      for (bank <- 0 until acc_banks) {
+
+        // ExecuteController raw output
+        router.io.exWrite(bank) <> ex_controller.io.acc.write(bank)
+
+        // PoTal classification from Mesh tag
+        router.io.isPoTal(bank) := ex_controller.io.potalRawWriteValid(bank)
+
+        // Raw PoTal output enters SCU writeback
+        wb.io.rawWrite(bank) <> router.io.rawWrite(bank)
+
+        // Scaled SCU output returns to ACC arbiter
+        router.io.scaledWrite(bank) <> wb.io.scaledWrite(bank)
+
+        // Final physical ACC destination
+        spad.module.io.acc.write(bank) <> router.io.accWrite(bank)
+      }
+
+    case None =>
+      // Preserve original Gemmini configuration.
+      ex_controller.io.acc.write <> spad.module.io.acc.write
+  }
+
+  potalAccRouterOpt.foreach { router =>
+    for (bank <- 0 until acc_banks) {
+      when(router.io.exWrite(bank).valid && router.io.isPoTal(bank)) {
+        assert(router.io.rawWrite(bank).fire, "PoTal raw ACC output was not accepted")
+      }
+    }
+  }
   // Im2Col unit
   val im2col = withClock (gated_clock) { Module(new Im2Col(outer.config)) }
 
@@ -484,23 +525,85 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   */
 
   //-------------------------------------------------------------------------
-  // risc
-  val reservation_station_completed_arb = Module(new Arbiter(UInt(log2Up(reservation_station_entries).W), 3))
 
-  reservation_station_completed_arb.io.in(0).valid := ex_controller.io.completed.valid
-  reservation_station_completed_arb.io.in(0).bits := ex_controller.io.completed.bits
 
-  reservation_station_completed_arb.io.in(1) <> load_controller.io.completed
-  reservation_station_completed_arb.io.in(2) <> store_controller.io.completed
+  // ============================================================
+  // W3-2c-4b: ROB completion routing
+  //
+  // Normal EX:
+  //   EX completed -> WB immediate queue -> RS
+  //
+  // PoTal EX:
+  //   EX completed -> WB rawDone
+  //   Scaled ACC commit -> WB writeDone
+  //   Both done -> WB delayed queue -> RS
+  // ============================================================
 
-  // mux with cisc frontend arbiter
-  reservation_station_completed_arb.io.in(0).valid := ex_controller.io.completed.valid // && !is_cisc_mode
-  reservation_station_completed_arb.io.in(1).valid := load_controller.io.completed.valid // && !is_cisc_mode
-  reservation_station_completed_arb.io.in(2).valid := store_controller.io.completed.valid // && !is_cisc_mode
+  val reservation_station_completed_arb =
+    Module(new Arbiter(
+      UInt(ROB_ID_WIDTH.W), 3
+    ))
 
-  reservation_station.io.completed.valid := reservation_station_completed_arb.io.out.valid
-  reservation_station.io.completed.bits := reservation_station_completed_arb.io.out.bits
+  potalWritebackOpt match {
+
+    case Some(wb) =>
+
+      // All EX completion events enter PoTalWriteback.
+      // WB decides whether the ROB ID belongs to
+      // a normal EX command or an active PoTal context.
+      wb.io.rawCompletion.valid :=
+        ex_controller.io.completed.valid
+
+      wb.io.rawCompletion.bits :=
+        ex_controller.io.completed.bits
+
+      // This is the ONLY EX completion source
+      // connected to the ReservationStation arbiter.
+      reservation_station_completed_arb.io.in(0) <>
+        wb.io.robCompletion
+
+      // Check that a PoTal Mesh completion and the
+      // normal EX completion refer to the same ROB ID.
+      when(ex_controller.io.potalMeshCompleted.valid) {
+
+        assert(
+          ex_controller.io.completed.valid,
+          "PoTal Mesh completion missing EX completion"
+        )
+
+        assert(
+          ex_controller.io.completed.bits ===
+            ex_controller.io.potalMeshCompleted.bits,
+          "PoTal Mesh/EX ROB ID mismatch"
+        )
+      }
+
+    case None =>
+
+      // Original Gemmini path without PoTal.
+      reservation_station_completed_arb.io.in(0).valid :=
+        ex_controller.io.completed.valid
+
+      reservation_station_completed_arb.io.in(0).bits :=
+        ex_controller.io.completed.bits
+  }
+
+  // Load/Store completion paths are unchanged.
+  reservation_station_completed_arb.io.in(1) <>
+    load_controller.io.completed
+
+  reservation_station_completed_arb.io.in(2) <>
+    store_controller.io.completed
+
+  // Deliver one completed ROB ID to ReservationStation.
+  reservation_station.io.completed.valid :=
+    reservation_station_completed_arb.io.out.valid
+
+  reservation_station.io.completed.bits :=
+    reservation_station_completed_arb.io.out.bits
+
   reservation_station_completed_arb.io.out.ready := true.B
+
 
   // ============================================================
   // PoTal RELEASE / FENCE drain condition

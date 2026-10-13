@@ -4,7 +4,7 @@ import chisel3._
 import chisel3.iotesters._
 
 class PoTalWritebackTester(
-  dut: PoTalWriteback,
+  dut: PoTalWriteback[SInt, Float, Float],
   scenario: Int
 ) extends PeekPokeTester(dut) {
   private val zero = BigInt("80000000", 16)
