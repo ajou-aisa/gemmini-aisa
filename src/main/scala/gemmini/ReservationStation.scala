@@ -53,6 +53,9 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
 
     val busy = Output(Bool())
 
+    // Unlike busy, this is true only when every reservation-station entry has been retired.
+    val drained = Output(Bool())
+
     val counter = new CounterEventIO()
   })
 
@@ -128,6 +131,8 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
   val full_st = entries_st.map(_.valid).reduce(_ && _)
 
   val empty = !entries.map(_.valid).reduce(_ || _)
+  io.drained := empty
+
   val full = entries.map(_.valid).reduce(_ && _)
 
   val utilization = PopCount(entries.map(e => e.valid)) // TODO it may be cheaper to count the utilization in a register, rather than performing a PopCount

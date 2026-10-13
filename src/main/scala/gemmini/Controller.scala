@@ -60,7 +60,6 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
 
   // Counters
   val counters = Module(new CounterController(outer.config.num_counter, outer.xLen))
-  io.resp <> counters.io.out  // Counter access command will be committed immediately
   counters.io.event_io.external_values(0) := 0.U
   counters.io.event_io.event_signal(0) := false.B
   counters.io.in.valid := false.B
@@ -84,6 +83,66 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   val clock_en_reg = RegInit(true.B)
   val gated_clock = if (clock_gate) ClockGate(clock, clock_en_reg, "gemmini_clock_gate") else clock
   outer.spad.module.clock := gated_clock
+
+  
+  // ============================================================
+  // W3-2b-2: PoTal scale-command ingress
+  //
+  // At this stage PoTalWriteback owns the real ScaleMemory,
+  // but its raw EX/ACC data path remains disconnected.
+  //
+  // PoTal execution writeback is NOT enabled yet.
+  // ============================================================
+
+  val potalIngressOpt =
+    if (enablePoTalSat32Acc) {
+      Some(withClock(gated_clock) {
+        Module(new PoTalScaleCommandIngress(DIM))
+      })
+    } else {
+      None
+    }
+
+  val potalWritebackOpt =
+    if (enablePoTalSat32Acc) {
+      Some(withClock(gated_clock) {
+        Module(new PoTalWriteback(outer.config))
+      })
+    } else {
+      None
+    }
+
+  // Connect scale commands to the actual ScaleMemory
+  // owned by PoTalWriteback.
+  potalIngressOpt.zip(potalWritebackOpt).foreach {
+    case (ingress, wb) =>
+
+      wb.io.scaleLoad <> ingress.io.scaleLoad
+      wb.io.scaleRelease <> ingress.io.scaleRelease
+
+      ingress.io.scaleConflict := wb.io.error.scaleConflict
+
+      ingress.io.releaseMiss := wb.io.error.releaseMiss
+
+      // W3-2b-2: do not connect the raw datapath yet.
+      wb.io.contextIssue.valid := false.B
+      wb.io.contextIssue.bits := 0.U.asTypeOf(wb.io.contextIssue.bits)
+
+      wb.io.rawCompletion.valid := false.B
+      wb.io.rawCompletion.bits := 0.U
+
+      for (bank <- 0 until acc_banks) {
+        wb.io.rawWrite(bank).valid := false.B
+        wb.io.rawWrite(bank).bits := 0.U.asTypeOf(wb.io.rawWrite(bank).bits)
+
+        // No scaled writes can be generated without a context.
+        // Acknowledge the unused output for this stage only.
+        wb.io.scaledWrite(bank).ready := true.B
+      }
+
+      wb.io.robCompletion.ready := true.B
+      wb.io.workDone.ready := true.B
+  }
 
   /*
   //=========================================================================
@@ -142,11 +201,58 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
 
   val raw_cmd = raw_cmd_q.io.deq
 
+
+  // ============================================================
+  // Dispatch PoTal control commands before LoopConv/LoopMatmul
+  // ============================================================
+
+  val rawFunct = raw_cmd.bits.cmd.inst.funct
+
+  val isPoTalControl =
+    rawFunct === POTAL_SCALE_WRITE ||
+    rawFunct === POTAL_SCALE_RELEASE ||
+    rawFunct === POTAL_FENCE
+
+  val gemminiRawCmd = Wire(Decoupled(new GemminiCmd(reservation_station_entries)))
+
+  gemminiRawCmd.bits := raw_cmd.bits
+
+  // Preserve the original command path for non-PoTal
+  // configurations.
+    if (enablePoTalSat32Acc) {
+      gemminiRawCmd.valid := raw_cmd.valid && !isPoTalControl
+    } else {
+      gemminiRawCmd.valid := raw_cmd.valid
+    }
+
+  potalIngressOpt match {
+    case Some(ingress) =>
+
+      ingress.io.cmd.valid := raw_cmd.valid && isPoTalControl
+
+      ingress.io.cmd.bits.funct := rawFunct
+      ingress.io.cmd.bits.rs1 := raw_cmd.bits.cmd.rs1
+      ingress.io.cmd.bits.rs2 := raw_cmd.bits.cmd.rs2
+      ingress.io.cmd.bits.rd := raw_cmd.bits.cmd.inst.rd
+      ingress.io.cmd.bits.xd := raw_cmd.bits.cmd.inst.xd
+
+      // One FIFO head is routed to exactly one consumer.
+      raw_cmd.ready := Mux(
+        isPoTalControl,
+        ingress.io.cmd.ready,
+        gemminiRawCmd.ready
+      )
+
+    case None =>
+      raw_cmd.ready := gemminiRawCmd.ready
+  }
+
+
   val max_lds = reservation_station_entries_ld
   val max_exs = reservation_station_entries_ex
   val max_sts = reservation_station_entries_st
 
-  val (conv_cmd, loop_conv_unroller_busy) = withClock (gated_clock) { LoopConv(raw_cmd, reservation_station.io.conv_ld_completed, reservation_station.io.conv_st_completed, reservation_station.io.conv_ex_completed,
+  val (conv_cmd, loop_conv_unroller_busy) = withClock (gated_clock) { LoopConv(gemminiRawCmd, reservation_station.io.conv_ld_completed, reservation_station.io.conv_st_completed, reservation_station.io.conv_ex_completed,
     meshRows*tileRows, coreMaxAddrBits, reservation_station_entries, max_lds, max_exs, max_sts, sp_banks * sp_bank_entries, acc_banks * acc_bank_entries,
     inputType.getWidth, accType.getWidth, dma_maxbytes,
     new ConfigMvinRs1(mvin_scale_t_bits, block_stride_bits, pixel_repeats_bits), new MvinRs2(mvin_rows_bits, mvin_cols_bits, local_addr_t),
@@ -330,12 +436,87 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   reservation_station.io.completed.bits := reservation_station_completed_arb.io.out.bits
   reservation_station_completed_arb.io.out.ready := true.B
 
-  // Wire up global RoCC signals
-  io.busy := raw_cmd.valid || loop_conv_unroller_busy || loop_matmul_unroller_busy || reservation_station.io.busy || spad.module.io.busy || unrolled_cmd.valid || loop_cmd.valid || conv_cmd.valid
+  // ============================================================
+  // PoTal RELEASE / FENCE drain condition
+  // ============================================================
+  
+  // Do not include raw_cmd.valid:
+  // the current RELEASE/FENCE command occupies raw_cmd.
+  val olderGemminiDrained =
+    !loop_conv_unroller_busy &&
+    !loop_matmul_unroller_busy &&
+    !conv_cmd.valid &&
+    !loop_cmd.valid &&
+    !unrolled_cmd.valid &&
+    reservation_station.io.drained &&
+    !load_controller.io.busy &&
+    !store_controller.io.busy &&
+    !ex_controller.io.busy &&
+    !spad.module.io.busy
 
+  potalIngressOpt.zip(potalWritebackOpt).foreach {
+    case (ingress, wb) =>
+      val allDrained =
+        olderGemminiDrained && wb.io.drained
+
+      ingress.io.releaseSafe := allDrained
+      ingress.io.fenceDrained := allDrained
+  }
+
+  // ============================================================
+  // Wire up global RoCC signals
+  // ============================================================
+
+  val potalResponsePending =
+    potalIngressOpt
+      .map(_.io.resp.valid)
+      .getOrElse(false.B)
+
+  io.busy :=
+    raw_cmd.valid ||
+    loop_conv_unroller_busy ||
+    loop_matmul_unroller_busy ||
+    reservation_station.io.busy ||
+    spad.module.io.busy ||
+    unrolled_cmd.valid ||
+    loop_cmd.valid ||
+    conv_cmd.valid ||
+    potalResponsePending
+
+ 
   io.interrupt := tlb.io.exp.map(_.interrupt).reduce(_ || _)
 
   // assert(!io.interrupt, "Interrupt handlers have not been written yet")
+
+  // ============================================================
+  // RoCC response arbitration
+  // ============================================================
+
+  potalIngressOpt match {
+    case Some(ingress) =>
+
+      val responseArb =
+        Module(new RRArbiter(new RoCCResponse, 2))
+
+      responseArb.io.in(0) <> counters.io.out
+
+      responseArb.io.in(1).valid :=
+        ingress.io.resp.valid
+
+      responseArb.io.in(1).bits.rd :=
+        ingress.io.resp.bits.rd
+
+      responseArb.io.in(1).bits.data :=
+        ingress.io.resp.bits.status
+
+      ingress.io.resp.ready :=
+        responseArb.io.in(1).ready
+
+      io.resp <> responseArb.io.out
+
+    case None =>
+      io.resp <> counters.io.out
+  }
 
   // Cycle counters
   val incr_ld_cycles = load_controller.io.busy && !store_controller.io.busy && !ex_controller.io.busy

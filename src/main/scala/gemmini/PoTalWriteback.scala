@@ -4,9 +4,10 @@ import chisel3._
 import chisel3.util._
 import Arithmetic.SIntArithmetic
 
-// The producer maps a K32 block and an output N tile to a scale slot:
+// A scale block and output N tile map to a scale slot:
 //   scaleBase + blockIndex * outputTileCount + outputTileIndex.
-// blockIndex is relative to the active scale-cache window.
+//
+// Each scale block contains passesPerBlock physical K tiles.
 final class PoTalOutputContext(
   dim: Int,
   robWidth: Int,
@@ -61,8 +62,8 @@ final class PoTalQueuedContext(
 
 // Standalone PoTal writeback. The Controller and RoCC command/scale-loading
 // ingress are deliberately NOT connected in this module.
-final class PoTalWriteback(
-  config: GemminiArrayConfig[SInt, Float, Float],
+final class PoTalWriteback[T <: Data : Arithmetic, U <: Data, V <: Data](
+  config: GemminiArrayConfig[T, U, V],
   scaleEntries: Int = 256,
   generationWidth: Int = 8,
   workEntries: Int = 128,
@@ -72,6 +73,9 @@ final class PoTalWriteback(
   private val dim = config.DIM
   private val depth = if (queueDepth < 0) 2 * dim else queueDepth
   require(config.dataflow == Dataflow.WS)
+  require(config.inputType.isInstanceOf[SInt])
+  require(config.spatialArrayOutputType.isInstanceOf[SInt])
+  require(config.accType.isInstanceOf[SInt])
   require(config.tileColumns == 1 && config.tileRows == 1)
   require(config.accType.getWidth == 32)
   require(config.acc_banks >= 2)
