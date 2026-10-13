@@ -56,7 +56,6 @@ tests = \
 	resadd_stride \
 	global_average \
 	gemmini_counter \
-	potal_scale_control \
 	template \
 
 tests_baremetal = $(tests:=-baremetal)
@@ -134,3 +133,6 @@ run-baremetal: $(runs_baremetal)
 
 junk += $(tests_baremetal) $(tests_linux) $(tests_pk)
 
+.PHONY: potal-tests
+
+potal-tests: potal_scale_control-baremetal potal_fence_dma-baremetal
