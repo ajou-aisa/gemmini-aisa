@@ -112,6 +112,19 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
       None
     }
 
+  // W3-2c-2: PRELOAD and context reservation handshake
+  val potalPreloadGateOpt =
+    if (enablePoTalSat32Acc) {
+      Some(withClock(gated_clock) {
+        Module(new PoTalPreloadReservationGate(
+          dim = DIM,
+          robWidth = ROB_ID_WIDTH
+        ))
+      })
+    } else {
+      None
+    }
+
   // Connect scale commands to the actual ScaleMemory
   // owned by PoTalWriteback.
   potalIngressOpt.zip(potalWritebackOpt).foreach {
@@ -125,9 +138,6 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
       ingress.io.releaseMiss := wb.io.error.releaseMiss
 
       // W3-2b-2: do not connect the raw datapath yet.
-      wb.io.contextIssue.valid := false.B
-      wb.io.contextIssue.bits := 0.U.asTypeOf(wb.io.contextIssue.bits)
-
       wb.io.rawCompletion.valid := false.B
       wb.io.rawCompletion.bits := 0.U
 
@@ -142,6 +152,13 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
 
       wb.io.robCompletion.ready := true.B
       wb.io.workDone.ready := true.B
+  }
+
+  // W3-2c-2: Connect atomic PRELOAD reservation
+  // to the existing PoTalWriteback context queue.
+  potalPreloadGateOpt.zip(potalWritebackOpt).foreach {
+    case (gate, wb) =>
+      wb.io.contextIssue <> gate.io.contextIssue
   }
 
   /*
@@ -350,11 +367,60 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   store_controller.io.cmd.bits := reservation_station.io.issue.st.cmd
   store_controller.io.cmd.bits.rob_id.push(reservation_station.io.issue.st.rob_id)
 
-  ex_controller.io.cmd.valid := reservation_station.io.issue.ex.valid
-  reservation_station.io.issue.ex.ready := ex_controller.io.cmd.ready
-  ex_controller.io.cmd.bits := reservation_station.io.issue.ex.cmd
-  ex_controller.io.cmd.bits.rob_id.push(reservation_station.io.issue.ex.rob_id)
 
+  // ============================================================
+  // W3-2c-2: ReservationStation -> ExecuteController
+  //
+  // PoTal PRELOAD requires atomic context reservation.
+  // Normal Gemmini commands do not require a context.
+  // ============================================================
+
+  val exIssue = reservation_station.io.issue.ex
+
+  potalPreloadGateOpt match {
+
+    case Some(gate) =>
+
+      gate.io.sourceValid := exIssue.valid
+
+      gate.io.isPreload := exIssue.cmd.cmd.inst.funct === PRELOAD_CMD
+
+      gate.io.metadata := exIssue.cmd.potal
+
+      gate.io.robId := exIssue.rob_id
+
+      // PRELOAD rs2 format:
+      // [63:48] C rows
+      // [47:32] C columns
+      // [31: 0] C local address
+      gate.io.validRows :=
+        exIssue.cmd.cmd.rs2(
+          48 + log2Up(DIM + 1) - 1, 48
+        )
+
+      gate.io.validColumns :=
+        exIssue.cmd.cmd.rs2(
+          32 + log2Up(DIM + 1) - 1, 32
+        )
+
+      gate.io.executeReady := ex_controller.io.cmd.ready
+
+      ex_controller.io.cmd.valid := gate.io.executeValid
+
+      exIssue.ready := gate.io.sourceReady
+
+    case None =>
+
+      // Original Gemmini command path.
+      ex_controller.io.cmd.valid := exIssue.valid
+      exIssue.ready := ex_controller.io.cmd.ready
+  }
+
+  // Command data and ROB ID are unchanged.
+  ex_controller.io.cmd.bits := exIssue.cmd
+  ex_controller.io.cmd.bits.rob_id.push(exIssue.rob_id)
+
+  
   // Wire up scratchpad to controllers
   spad.module.io.dma.read <> load_controller.io.dma
   spad.module.io.dma.write <> store_controller.io.dma
