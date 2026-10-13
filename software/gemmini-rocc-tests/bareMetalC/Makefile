@@ -56,6 +56,7 @@ tests = \
 	resadd_stride \
 	global_average \
 	gemmini_counter \
+	potal_scale_control \
 	template \
 
 tests_baremetal = $(tests:=-baremetal)
