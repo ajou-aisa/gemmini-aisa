@@ -19,6 +19,9 @@ class GemminiCmd(rob_entries: Int)(implicit p: Parameters) extends Bundle {
   val rob_id = UDValid(UInt(log2Up(rob_entries).W))
   val from_matmul_fsm = Bool()
   val from_conv_fsm = Bool()
+
+  // PoTal metadata follows the command through LoopConv, LoopMatmul and RS
+  val potal = new PoTalCommandMetadata
 }
 
 class Gemmini[T <: Data : Arithmetic, U <: Data, V <: Data](val config: GemminiArrayConfig[T, U, V])
@@ -135,6 +138,7 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   raw_cmd_q.io.enq.bits.rob_id := DontCare
   raw_cmd_q.io.enq.bits.from_conv_fsm := false.B
   raw_cmd_q.io.enq.bits.from_matmul_fsm := false.B
+  raw_cmd_q.io.enq.bits.potal := 0.U.asTypeOf(new PoTalCommandMetadata)
 
   val raw_cmd = raw_cmd_q.io.deq
 

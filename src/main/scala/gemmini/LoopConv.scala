@@ -1241,6 +1241,10 @@ class LoopConv (block_size: Int, coreMaxAddrBits: Int, reservation_station_size:
   val is_loop_cmd = is_loop_run_cmd || is_loop_config_cmd
 
   io.out.bits.cmd := Mux(loop_configured, unrolled_cmd.bits, cmd.bits.cmd)
+  // Commands generated internally by LoopConv do not carry PoTal Main-GEMM metadata.
+  // Directly forwarded commands retain their metadata.
+  io.out.bits.potal := Mux(loop_configured, 0.U.asTypeOf(new PoTalCommandMetadata), cmd.bits.potal)  
+
   io.out.bits.cmd.status := cmd.bits.cmd.status // TODO This is not guaranteed to be the correct fix! We must fix this
   io.out.bits.rob_id := DontCare
   io.out.bits.from_matmul_fsm := Mux(loop_configured, false.B, cmd.bits.from_matmul_fsm)
