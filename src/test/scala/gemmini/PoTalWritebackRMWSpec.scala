@@ -7,6 +7,26 @@ import Arithmetic.SIntArithmetic
 
 import scala.collection.mutable.ArrayBuffer
 
+
+final class PoTalObservedAccumulatorMem(
+  entries: Int,
+  rowType: Vec[Vec[SInt]],
+  latency: Int
+) extends AccumulatorMem[SInt, Float](
+  entries, rowType,
+  (x: SInt, _: Float) => x,
+  Float(8, 24),
+  false, 2, false,
+  latency, SInt(32.W), false
+) {
+  // Test-only observation of the physical SRAM write stage.
+  val commitPulse = IO(Output(Bool()))
+
+  commitPulse :=
+    pipelined_writes(latency - 1).valid
+}
+
+
 // W2: PoTalWriteback -> two real AccumulatorMem banks -> AccPipeShared(Sat32).
 // This intentionally does NOT instantiate the full Scratchpad/TileLink subsystem.
 final class PoTalWritebackRMWHarness extends Module {
@@ -38,9 +58,18 @@ final class PoTalWritebackRMWHarness extends Module {
     val readResp = Vec(config.acc_banks, Decoupled(rowType.cloneType))
 
     val accWriteAccepted = Output(Vec(config.acc_banks, Bool()))
+    val accSramCommit = Output(Vec(config.acc_banks, Bool()))
     val pipelineDrained = Output(Bool())
     val drained = Output(Bool())
     val error = Output(Bool())
+
+    // Test-only ACC backpressure control.
+    val holdAccWrites = Input(Bool())
+
+    // Scaled writes waiting at the physical ACC interface.
+    val scaledPending = Output(
+      Vec(config.acc_banks, Bool())
+    )
   })
 
   val writeback = Module(new PoTalWriteback(
@@ -71,22 +100,28 @@ final class PoTalWritebackRMWHarness extends Module {
   ))
 
   val memories = Seq.fill(config.acc_banks) {
-    Module(new AccumulatorMem(
+    Module(new PoTalObservedAccumulatorMem(
       config.acc_bank_entries,
       rowType,
-      (x: SInt, _: Float) => x,
-      Float(8, 24),
-      false, 2, false,
-      config.acc_latency,
-      SInt(32.W),
-      false
+      config.acc_latency
     ))
   }
 
   for ((mem, bank) <- memories.zipWithIndex) {
     // The writeback receives REAL ACC backpressure and cannot bypass SRAM.
-    mem.io.write <> writeback.io.scaledWrite(bank)
-    io.accWriteAccepted(bank) := mem.io.write.fire
+    val scaled = writeback.io.scaledWrite(bank)
+    
+    // Force physical ACC backpressure without changing
+    // the production PoTalWriteback or AccumulatorMem.
+    mem.io.write.valid := scaled.valid && !io.holdAccWrites
+
+    mem.io.write.bits := scaled.bits
+
+    scaled.ready :=mem.io.write.ready && !io.holdAccWrites
+
+    io.scaledPending(bank) := scaled.valid
+    io.accWriteAccepted(bank) := mem.io.write.fire 
+    io.accSramCommit(bank) := mem.commitPulse
 
     // Exactly the RMW adder-sharing topology in Scratchpad.scala.
     shared.io.in_sel(bank) := mem.io.adder.valid
@@ -121,6 +156,16 @@ class PoTalWritebackRMWTester(
   private val completedRob = ArrayBuffer.empty[Int]
   private val completedWork = ArrayBuffer.empty[Int]
   private val acceptedWrites = Array.fill(2)(0)
+  private val acceptedEvents = ArrayBuffer.empty[(Int, Int)]
+
+  private val committedWrites = Array.fill(2)(0)
+  private val committedEvents = ArrayBuffer.empty[(Int, Int)]
+
+  private val robCycles = ArrayBuffer.empty[(Int, Int)]
+
+  private val workCycles = ArrayBuffer.empty[(Int, Int)]
+
+  private var testCycle = 0
 
   poke(dut.io.contextIssue.valid, 0)
   poke(dut.io.rawCompletion.valid, 0)
@@ -129,6 +174,7 @@ class PoTalWritebackRMWTester(
   poke(dut.io.scaleRelease.valid, 0)
   poke(dut.io.robCompletion.ready, 1)
   poke(dut.io.workDone.ready, 1)
+  poke(dut.io.holdAccWrites, 0)
 
   for (bank <- 0 until 2) {
     poke(dut.io.rawWrite(bank).valid, 0)
@@ -146,28 +192,106 @@ class PoTalWritebackRMWTester(
 
   // Observe handshakes BEFORE the rising edge; this catches completions
   // even when they occur during the load/issue/raw helper procedures.
+
   private def tick(count: Int = 1): Unit = {
     for (_ <- 0 until count) {
+
       expect(dut.io.error, 0)
-      for (bank <- 0 until 2)
-        if (peek(dut.io.accWriteAccepted(bank)) == 1)
-          acceptedWrites(bank) += 1
+
+      // Record actual physical ACC write acceptance.
+      val firedBanks = (0 until 2).filter { bank =>
+        peek(dut.io.accWriteAccepted(bank)) == 1
+      }
+
+      // PoTal WB emits at most one scaled row per cycle.
+      assert(
+        firedBanks.size <= 1,
+        "Multiple physical ACC writes in one cycle"
+      )
+
+      firedBanks.foreach { bank =>
+        acceptedWrites(bank) += 1
+        acceptedEvents += ((testCycle, bank))
+      }
+
+
+      // Physical SRAM write stage.
+      // Sampled before the rising edge that writes SRAM.
+      for (bank <- 0 until 2) {
+        if (peek(dut.io.accSramCommit(bank)) == 1) {
+          committedWrites(bank) += 1
+          committedEvents += ((testCycle, bank))
+        }
+
+        assert(
+          committedWrites(bank) <= acceptedWrites(bank),
+          s"SRAM committed before ACC acceptance on bank $bank"
+        )
+      }
+
+
       if (peek(dut.io.robCompletion.valid) == 1 &&
           peek(dut.io.robCompletion.ready) == 1) {
-        val id = peek(dut.io.robCompletion.bits).toInt
-        assert(acceptedWrites(scenario) >= id,
-          s"ROB $id completed before its ACC write was accepted")
+
+        val id =
+          peek(dut.io.robCompletion.bits).toInt
+
+        if (scenario == 2) {
+          assert(id >= 1 && id <= 6)
+
+          val bank = if (id % 2 == 1) 0 else 1
+          val required = (id + 1) / 2
+
+          assert(
+            committedWrites(bank) >= required,
+            s"ROB $id completed before SRAM commit"
+          )
+        } else {
+          assert(
+            acceptedWrites(scenario) >= id,
+            s"ROB $id completed before ACC write"
+          )
+        }
+
+        assert(
+          !completedRob.contains(id),
+          s"Duplicate ROB completion $id"
+        )
+
         completedRob += id
+        robCycles += ((id, testCycle))
       }
+
       if (peek(dut.io.workDone.valid) == 1 &&
           peek(dut.io.workDone.ready) == 1) {
-        assert(acceptedWrites(scenario) == 3,
-          "workDone occurred before all ACC writes were accepted")
-        completedWork += peek(dut.io.workDone.bits).toInt
+
+        val work =
+          peek(dut.io.workDone.bits).toInt
+
+        val bank =
+          if (scenario == 2) work else scenario
+
+        assert(bank >= 0 && bank < 2)
+
+        assert(
+          committedWrites(bank) == 3,
+          s"Work $work completed before all ACC writes"
+        )
+
+        assert(
+          !completedWork.contains(work),
+          s"Duplicate work completion $work"
+        )
+
+        completedWork += work
+        workCycles += ((work, testCycle))
       }
+
       step(1)
+      testCycle += 1
     }
   }
+
 
   private def load(col: Int, block: Int, carrier: BigInt): Unit = {
     poke(dut.io.scaleLoad.bits.column, col)
@@ -184,11 +308,12 @@ class PoTalWritebackRMWTester(
     block: Int,
     rob: Int,
     first: Boolean,
-    last: Boolean
+    last: Boolean,
+    work: Int = 0
   ): Unit = {
     val c = dut.io.contextIssue
     poke(c.bits.robId, rob)
-    poke(c.bits.workId, 0)
+    poke(c.bits.workId, work)
     poke(c.bits.blockIndex, block)
     poke(c.bits.scaleBase, 0)
     poke(c.bits.outputTileCount, 1)
@@ -332,15 +457,207 @@ class PoTalWritebackRMWTester(
     awaitDone(expectBank = 1)
     readExpect(bank = 1, address = 4, expected0 = 14,
       expected1 = 8)
-  } else {
-    throw new IllegalArgumentException("unknown W2 scenario")
+  } else if (scenario == 2) {
+
+    // ========================================================
+    // W3-2c-9b-2: Physical ACC collision stress
+    //
+    // Work 0 -> Bank 0, Row 3
+    // Work 1 -> Bank 1, Row 3
+    //
+    // Six scaled writes are buffered while physical ACC
+    // acceptance is blocked, then released together.
+    // ========================================================
+
+    // Block 0: col0 x1, col1 x2
+    load(0, 0, 0)
+    load(1, 0, 1)
+
+    // Block 1: col0 x2, col1 x1
+    load(0, 1, 1)
+    load(1, 1, 0)
+
+    // Block 2: col0 x1, col1 x0
+    load(0, 2, 0)
+    load(1, 2, zeroCarrier)
+
+    // Hold physical ACC writes.
+    poke(dut.io.holdAccWrites, 1)
+
+    // --------------------------------------------------------
+    // First contributions: ACC overwrite
+    // --------------------------------------------------------
+
+    issue(block=0, rob=1, first=true, last=false, work=0)
+    raw(bank=0, address=3, a=7, b = -3, accumulate=false, rob=1)
+
+    issue(block=0, rob=2, first=true, last=false, work=1)
+    raw(bank=1, address=3, a = -4, b=6, accumulate=false, rob=2)
+
+    // --------------------------------------------------------
+    // Second contributions: ACC accumulation
+    // --------------------------------------------------------
+
+    issue(block=1, rob=3, first=false, last=false, work=0)
+    raw(bank=0, address=3, a=8, b=4, accumulate=true, rob=3)
+
+    issue(block=1, rob=4, first=false, last=false, work=1)
+    raw(bank=1, address=3, a=5, b = -7, accumulate=true, rob=4)
+
+    // --------------------------------------------------------
+    // Final contributions
+    // --------------------------------------------------------
+
+    issue(block=2, rob=5, first=false, last=true, work=0)
+    raw(bank=0, address=3, a = -5, b=100, accumulate=true, rob=5)
+
+    issue(block=2, rob=6, first=false, last=true, work=1)
+    raw(bank=1, address=3, a=2, b=10, accumulate=true, rob=6)
+
+    // --------------------------------------------------------
+    // Verify that ACC backpressure prevents completion.
+    // --------------------------------------------------------
+
+    expect(dut.io.scaledPending(0), 1)
+    expect(dut.io.scaledPending(1), 0)
+    expect(dut.io.pipelineDrained, 0)
+
+    tick(5)
+
+    assert(acceptedWrites.toSeq == Seq(0, 0))
+    assert(completedRob.isEmpty)
+    assert(completedWork.isEmpty)
+
+    // --------------------------------------------------------
+    // Release ACC backpressure.
+    // --------------------------------------------------------
+
+    poke(dut.io.holdAccWrites, 0)
+
+    var cycles = 0
+
+    while (
+      (completedRob.size < 6 ||
+       completedWork.size < 2 ||
+       peek(dut.io.drained) == 0) &&
+      cycles < 180
+    ) {
+      tick()
+      cycles += 1
+    }
+
+    assert(cycles < 180, "Timeout draining ACC collision stress")
+
+    // Exactly three writes accepted by each bank.
+    assert(acceptedWrites.toSeq == Seq(3, 3))
+    assert(committedWrites.toSeq == Seq(3, 3))
+
+    // FIFO order must be preserved across bank switches.
+    assert(acceptedEvents.map(_._2).toSeq == Seq(0, 1, 0, 1, 0, 1), s"Unexpected ACC bank write order: $acceptedEvents")
+
+    // Same-bank, same-row writes must be sufficiently
+    // separated for the two-cycle ACC pipeline.
+    for (bank <- 0 until 2) {
+      val times = acceptedEvents.collect {
+        case (cycle, b) if b == bank => cycle
+      }
+
+      assert(times.size == 3)
+
+      assert(
+        times(1) - times(0) >= 3 &&
+        times(2) - times(1) >= 3,
+        s"Unsafe same-row reuse on bank $bank: $times"
+      )
+    }
+
+
+    // Six physical SRAM commits, preserving FIFO order.
+    assert(committedEvents.size == 6)
+
+    assert(
+      committedEvents.map(_._2).toSeq ==
+        Seq(0, 1, 0, 1, 0, 1),
+      s"SRAM commit order mismatch: $committedEvents"
+    )
+
+    // Each accepted write enters SRAM after acc_latency cycles.
+    for (index <- acceptedEvents.indices) {
+      val (acceptCycle, acceptBank) =
+        acceptedEvents(index)
+
+      val (commitCycle, commitBank) =
+        committedEvents(index)
+
+      assert(acceptBank == commitBank)
+
+      assert(
+        commitCycle - acceptCycle ==
+          dut.config.acc_latency,
+        s"ACC write $index latency mismatch: " +
+        s"accepted=$acceptCycle committed=$commitCycle"
+      )
+    }
+
+    // ROB completion must follow the corresponding SRAM write.
+    for ((rob, completeCycle) <- robCycles) {
+      val commitCycle = committedEvents(rob - 1)._1
+
+      assert(
+        completeCycle > commitCycle,
+        s"ROB $rob retired before SRAM commit"
+      )
+    }
+
+    // Work completion must follow its final SRAM write.
+    for ((work, doneCycle) <- workCycles) {
+      val finalWriteIndex =
+        if (work == 0) 4 else 5
+
+      val commitCycle =
+        committedEvents(finalWriteIndex)._1
+
+      assert(
+        doneCycle > commitCycle,
+        s"Work $work completed before final SRAM write"
+      )
+    }
+
+    assert(completedRob.sorted.toSeq == (1 to 6).toSeq, s"Unexpected ROB completions: $completedRob")
+
+    assert(completedWork.sorted.toSeq == Seq(0, 1), s"Unexpected work completions: $completedWork")
+
+    expect(dut.io.pipelineDrained, 1)
+    expect(dut.io.drained, 1)
+
+    // --------------------------------------------------------
+    // Verify actual physical ACC SRAM contents.
+    //
+    // Bank 0:
+    //   col0 = 7 + 8*2 - 5 = 18
+    //   col1 = -3*2 + 4 + 0 = -2
+    //
+    // Bank 1:
+    //   col0 = -4 + 5*2 + 2 = 8
+    //   col1 = 6*2 - 7 + 0 = 5
+    // --------------------------------------------------------
+
+    tick(4)
+
+    readExpect(bank=0, address=3, expected0=18, expected1 = -2)
+
+    readExpect(bank=1, address=3, expected0=8, expected1=5)
+
+    println(s"W3-2c-9b PASS: writes=$acceptedWrites " + s"events=$acceptedEvents")
+    } else {
+      throw new IllegalArgumentException("unknown W2 scenario")
   }
 }
 
 class PoTalWritebackRMWSpec extends ChiselFlatSpec {
   behavior of "PoTal Writeback + physical ACC SRAM"
 
-  for (scenario <- 0 until 2) {
+  for (scenario <- 0 until 3) {
     it should s"preserve scale and Sat32 RMW in scenario $scenario" in {
       Driver.execute(
         Array("--backend-name", "treadle", "--target-dir",

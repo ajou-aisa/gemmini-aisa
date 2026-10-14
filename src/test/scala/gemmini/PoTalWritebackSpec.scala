@@ -239,6 +239,201 @@ class PoTalWritebackTester(
     issue(rob=2, work=1, block=0,
       first=true, last=true, rows=1, cols=1, accepted=false)
     expect(dut.io.pipelineDrained, 0)
+  } else if (scenario == 4) {
+    // W3-2c-9a:
+    // Context queue full + row-credit exhaustion +
+    // automatic admission recovery.
+    //
+    // contextDepth = 2
+    // queueDepth   = 32
+    // validRows    = 16 per context
+
+    // Three independent scale slots.
+    load(0, 0, 0) // x1
+    load(0, 1, 1) // x2
+    load(0, 2, 2) // x4
+
+    // Reserve all 32 row credits.
+    issue(
+      rob=1, work=0, block=0,
+      first=true, last=true,
+      rows=dim, cols=1
+    )
+    issue(
+      rob=2, work=1, block=1,
+      first=true, last=true,
+      rows=dim, cols=1
+    )
+
+    // Third context must not be accepted.
+    issue(
+      rob=3, work=2, block=2,
+      first=true, last=true,
+      rows=dim, cols=1,
+      accepted=false
+    )
+
+    // Keep context 3 pending, as a stalled PRELOAD would.
+    val third = dut.io.contextIssue
+    poke(third.valid, 1)
+
+    for (_ <- 0 until 4) {
+      expect(third.ready, 0)
+      expect(dut.io.pipelineDrained, 0)
+      step(1)
+    }
+
+    // Context 1 produces all 16 raw rows.
+    // Physical ACC writes remain blocked.
+    for (row <- 0 until dim) {
+      expect(third.ready, 0)
+      raw(
+        bank=0,
+        a=BigInt(row + 1),
+        b=BigInt(0),
+        accumulate=false,
+        row=row,
+        cols=1
+      )
+    }
+    rawComplete(1)
+
+    // Context 1 has left the context FIFO,
+    // but no row credits have been returned.
+    expect(third.ready, 0)
+    expect(dut.io.robCompletion.valid, 0)
+    expect(dut.io.workDone.valid, 0)
+
+    // Drain exactly 16 physical ACC writes.
+    poke(dut.io.scaledWrite(0).ready, 1)
+
+    for (row <- 0 until dim) {
+      // Until all 16 credits return, context 3
+      // must remain blocked.
+      expect(third.ready, 0)
+      expect(dut.io.scaledWrite(0).valid, 1)
+      expect(dut.io.scaledWrite(1).valid, 0)
+
+      expect(
+        dut.io.scaledWrite(0).bits.addr, row
+      )
+      expect(
+        dut.io.scaledWrite(0).bits.data(0)(0),
+        row + 1
+      )
+      expect(
+        dut.io.scaledWrite(0).bits.acc, 0
+      )
+      expect(
+        dut.io.scaledWrite(0).bits.mask(0), 1
+      )
+      expect(
+        dut.io.scaledWrite(0).bits.mask(4), 0
+      )
+
+      step(1)
+    }
+
+    // 16 credits have been returned.
+    // The pending third context must now be accepted.
+    expect(third.ready, 1)
+    step(1)
+    poke(third.valid, 0)
+
+    // Block physical ACC writes again.
+    poke(dut.io.scaledWrite(0).ready, 0)
+
+    // Context 2: raw=2*(row+1), scale=x2.
+    for (row <- 0 until dim) {
+      raw(
+        bank=0,
+        a=BigInt(2 * (row + 1)),
+        b=BigInt(0),
+        accumulate=false,
+        row=row,
+        cols=1
+      )
+    }
+    rawComplete(2)
+
+    // Context 3: raw=3*(row+1), scale=x4.
+    for (row <- 0 until dim) {
+      raw(
+        bank=0,
+        a=BigInt(3 * (row + 1)),
+        b=BigInt(0),
+        accumulate=false,
+        row=row,
+        cols=1
+      )
+    }
+    rawComplete(3)
+
+    // No further writes accepted while ready=0.
+    expect(dut.io.pipelineDrained, 0)
+
+    // Drain the remaining 32 rows.
+    poke(dut.io.scaledWrite(0).ready, 1)
+
+    for (index <- 0 until 2 * dim) {
+      val row = index % dim
+
+      val expected =
+        if (index < dim) 4 * (row + 1)
+        else 12 * (row + 1)
+
+      expect(dut.io.scaledWrite(0).valid, 1)
+      expect(dut.io.scaledWrite(1).valid, 0)
+      expect(dut.io.scaledWrite(0).bits.addr, row)
+      expect(
+        dut.io.scaledWrite(0).bits.data(0)(0),
+        expected
+      )
+      expect(dut.io.scaledWrite(0).bits.acc, 0)
+      expect(dut.io.scaledWrite(0).bits.mask(0), 1)
+
+      step(1)
+    }
+
+    // Publish completed ROB IDs and work IDs.
+    poke(dut.io.robCompletion.ready, 1)
+    poke(dut.io.workDone.ready, 1)
+
+    val robs =
+      scala.collection.mutable.ArrayBuffer.empty[Int]
+    val works =
+      scala.collection.mutable.ArrayBuffer.empty[Int]
+
+    for (_ <- 0 until 50) {
+      if (peek(dut.io.robCompletion.valid) == 1) {
+        robs += peek(dut.io.robCompletion.bits).toInt
+      }
+
+      if (peek(dut.io.workDone.valid) == 1) {
+        works += peek(dut.io.workDone.bits).toInt
+      }
+
+      step(1)
+    }
+
+    assert(
+      robs.sorted.toSeq == Seq(1, 2, 3),
+      s"Unexpected ROB completions: $robs"
+    )
+
+    assert(
+      works.sorted.toSeq == Seq(0, 1, 2),
+      s"Unexpected work completions: $works"
+    )
+
+    expect(dut.io.pipelineDrained, 1)
+    expect(dut.io.drained, 1)
+
+    // Scale entries can be released after drain.
+    release(0, 0)
+    release(0, 1)
+    release(0, 2)
+
   } else {
     throw new IllegalArgumentException("unknown scenario")
   }
@@ -247,7 +442,7 @@ class PoTalWritebackTester(
 class PoTalWritebackSpec extends ChiselFlatSpec {
   behavior of "PoTalWriteback"
 
-  for (scenario <- 0 until 4) {
+  for (scenario <- 0 until 5) {
     it should s"preserve K32 scale, row credit and completion scenario $scenario" in {
       val cfg = GemminiConfigs.defaultConfig.copy(
         dataflow = Dataflow.WS,
