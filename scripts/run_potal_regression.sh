@@ -167,6 +167,8 @@ run_soc_dim() {
         'potal_gemm_n32:POTAL_N32 PASS'
         'potal_gemm_m32n32:POTAL_N32 PASS'
         'potal_release_inflight:POTAL_RELEASE_INFLIGHT PASS'
+        'potal_scale_reuse_p1:POTAL_SCALE_REUSE_P1 PASS'
+        'potal_scale_reuse_p2:POTAL_SCALE_REUSE_P2 PASS'
         'potal_sat32_d16:POTAL_SAT32_D16 PASS'
       )
       ;;
